@@ -102,8 +102,8 @@ if (!failure) {
   process.exit(0);
 }
 
-const compiledFor = /NODE_MODULE_VERSION (\d+)/.exec(failure.stderr);
-const noBindings = /Could not locate the bindings file/.test(failure.stderr);
+const compiledFor = /NODE_MODULE_VERSION (\d+)/.exec(failure);
+const noBindings = /Could not locate the bindings file/.test(failure);
 
 console.error('');
 console.error('='.repeat(72));

@@ -32,6 +32,7 @@ describe('package.json allowScripts (npm 12 install-script gating, #162)', () =>
     expect(pkg.dependencies['better-sqlite3']).toBe('^13.0.3');
     expect(postinstall).not.toContain("npm(['rebuild', 'better-sqlite3']");
     expect(postinstall).not.toContain("npm(['run', 'build-release']");
+    expect(postinstall).not.toContain('failure.stderr');
   });
 
   it('explicitly denies sharp\'s postinstall (#102)', () => {
