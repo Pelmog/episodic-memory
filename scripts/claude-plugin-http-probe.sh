@@ -23,6 +23,8 @@ for a in "$@"; do
   esac
 done
 
+if [ "$((RUN_POS + RUN_NEG))" -eq 0 ]; then echo "usage error: flag combination runs zero cases" >&2; exit 2; fi
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PATH="$HOME/.local/share/episodic-memory/runtime/node-v24.21.0-darwin-arm64/bin:$PATH"
 PLUGIN=em-http-probe
@@ -54,7 +56,7 @@ HELPER
 }
 
 run_claude() { # $1=label ; prints JSON to $TMP/$1.json, returns claude exit code
-  local args=(-p "--plugin-dir=$TMP/$PLUGIN" --output-format json "--allowedTools=$TOOL")
+  local args=(-p "--plugin-dir=$TMP/$PLUGIN" --output-format json --no-session-persistence "--allowedTools=$TOOL")
   [ "$STRICT" = 1 ] && args+=(--strict-mcp-config)
   local prompt="Call the tool $TOOL exactly once with query \"zebra widget cache\" and response_format \"json\". Reply with only the number of results returned (the count), nothing else. If the tool is unavailable or errors, reply with exactly: TOOL_UNAVAILABLE_OR_ERROR followed by the error text."
   local rc=0
@@ -100,13 +102,18 @@ positive() {
   write_plugin "$URL" "$HELPER"
   local rc=0; run_claude pos || rc=$?
   echo "positive: claude exit=$rc"; [ -s "$TMP/pos.json" ] && summarise pos || { echo "stderr: $(head -c 400 "$TMP/pos.err")"; return 1; }
-  local calls; calls=$( [ "$LIVE" = 1 ] && echo n/a || wc -l < "$log" | tr -d ' ')
-  echo "positive: helper invocations=$calls"
+  local calls=0
+  [ "$LIVE" = 1 ] || calls=$(wc -l < "$log" | tr -d ' ')
+  echo "positive: helper invocations=$([ "$LIVE" = 1 ] && echo n/a || echo "$calls")"
+  # Non-live: helper must have run (auth was attempted) AND the count must equal the fixture's 3.
+  if [ "$LIVE" != 1 ] && [ "$calls" -lt 1 ]; then echo "positive: helper never invoked"; return 1; fi
+  local want=3; [ "$LIVE" = 1 ] && want=any
   node -e '
     const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));
-    const n=Number(String(j.result).trim());
-    process.exit(!j.is_error && Number.isInteger(n) && n>=1 && j.num_turns>=2 ? 0 : 1);
-  ' "$TMP/pos.json"
+    const want=process.argv[2], r=String(j.result).trim();
+    const ok=!j.is_error && /^\d+$/.test(r) && j.num_turns>=2 && (want==="any" ? Number(r)>=1 : Number(r)===Number(want));
+    process.exit(ok?0:1);
+  ' "$TMP/pos.json" "$want"
 }
 
 negative() {
@@ -116,10 +123,12 @@ negative() {
   local rc=0; run_claude neg || rc=$?
   echo "negative: claude exit=$rc"; [ -s "$TMP/neg.json" ] && summarise neg || echo "stderr: $(head -c 400 "$TMP/neg.err")"
   echo "negative: helper invocations=$(wc -l < "$log" | tr -d ' ')"
-  # Pass = no numeric count came back (tool unavailable / error)
+  local calls; calls=$(wc -l < "$log" | tr -d ' ')
+  [ "$calls" -ge 1 ] || { echo "negative: helper never invoked"; return 1; }
+  # Pass = Claude reported the auth rejection (not a crash/timeout/refusal).
   node -e '
-    let r=""; try{ r=String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).result).trim(); }catch{}
-    process.exit(/^\d+$/.test(r) && Number(r)>=1 ? 1 : 0);
+    let t=""; try{ t=String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).result); }catch{}
+    process.exit(/HEADERS_HELPER_AUTH_REJECTED|\b401\b/.test(t) ? 0 : 1);
   ' "$TMP/neg.json"
 }
 

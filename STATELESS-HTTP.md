@@ -120,6 +120,7 @@ The helper prints `{"Authorization":"Bearer <token>"}` reading the token from a 
 
 Evidence (temp service on a free port, isolated fixture index, scratch token; token never printed):
 
+- Pass criteria (hardened): positive needs helper invoked at least once AND result exactly 3 (the fixture count); negative needs helper invoked at least once AND `HEADERS_HELPER_AUTH_REJECTED`/401 in Claude's output; a flag combination that runs zero cases exits 2. Runs use `--no-session-persistence` so no transcript is written under `~/.claude`.
 - Positive: `claude -p --plugin-dir=<tmp>/em-http-probe --output-format json --allowedTools=mcp__plugin_em-http-probe_episodic-memory__search "<call search, query 'zebra widget cache', response_format json, print count>"`
   gave exit 0, `num_turns: 3`, `result: "3"`, helper invoked once.
 - Negative control (helper prints a wrong same-length token): exit 0, `num_turns: 1`, result:
@@ -128,7 +129,7 @@ Evidence (temp service on a free port, isolated fixture index, scratch token; to
 
 Findings and required flags:
 
-- **`--strict-mcp-config` hides plugin MCP servers** (tool absent: "No matching deferred tools found", helper never invoked, run twice). Do not use it; the probe omits it unless `--strict` is passed.
+- **`--strict-mcp-config` hides plugin MCP servers** (tool absent: "No matching deferred tools found", helper never invoked, run twice). Operator consequence: any headless/scripted `claude` run using `--strict-mcp-config` will not see the plugin's episodic-memory HTTP server. Do not use it; the probe omits it unless `--strict` is passed.
 - `--allowedTools` and `--plugin-dir` are variadic and swallow the trailing prompt; use the `--flag=value` form (or put the prompt first).
 - Re-run any time against the live service: `scripts/claude-plugin-http-probe.sh --live` (URL `http://127.0.0.1:8734/mcp`, helper `$HOME/.local/share/mcp-fleet/episodic-memory/headers-helper.sh`; positive case only).
 - The `user-scope` fallback (remove manifest servers, retarget `agents/search-conversations.md` `tools:` to `mcp__episodic-memory__`) is therefore not needed.
