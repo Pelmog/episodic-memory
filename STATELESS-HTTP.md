@@ -102,6 +102,38 @@ the `episodic-memory` tools are missing for that session. Start/restart it
 Codex picks the service up on its next session. Check
 `~/.local/share/mcp-fleet/episodic-memory/service.log` if it keeps failing.
 
+## Claude client mechanism
+
+**Decision: `plugin-manifest`.** A Claude Code plugin can declare the server as
+`type: http` with a `headersHelper`; verified empirically with `scripts/claude-plugin-http-probe.sh`
+on Claude Code **2.1.296** (2026-10-14).
+
+Manifest shape (`.claude-plugin/plugin.json`):
+
+```json
+{"name":"em-http-probe","version":"0.0.1","mcpServers":{"episodic-memory":
+  {"type":"http","url":"http://127.0.0.1:<port>/mcp","headersHelper":"<tmp>/helper.sh"}}}
+```
+
+The helper prints `{"Authorization":"Bearer <token>"}` reading the token from a 0600 file
+(token never in argv or Claude's env). Tool name: `mcp__plugin_<plugin>_episodic-memory__search`.
+
+Evidence (temp service on a free port, isolated fixture index, scratch token; token never printed):
+
+- Positive: `claude -p --plugin-dir=<tmp>/em-http-probe --output-format json --allowedTools=mcp__plugin_em-http-probe_episodic-memory__search "<call search, query 'zebra widget cache', response_format json, print count>"`
+  gave exit 0, `num_turns: 3`, `result: "3"`, helper invoked once.
+- Negative control (helper prints a wrong same-length token): exit 0, `num_turns: 1`, result:
+  `plugin:em-http-probe:episodic-memory failed to connect (HEADERS_HELPER_AUTH_REJECTED): Server rejected the Authorization header minted by the configured headersHelper (HTTP 401)`; helper invoked 3 times; no tool available.
+- Final line: `PASS positive_pass=1 negative_control_pass=1 failures=0 strict=0 live=0`.
+
+Findings and required flags:
+
+- **`--strict-mcp-config` hides plugin MCP servers** (tool absent: "No matching deferred tools found", helper never invoked, run twice). Do not use it; the probe omits it unless `--strict` is passed.
+- `--allowedTools` and `--plugin-dir` are variadic and swallow the trailing prompt; use the `--flag=value` form (or put the prompt first).
+- Re-run any time against the live service: `scripts/claude-plugin-http-probe.sh --live` (URL `http://127.0.0.1:8734/mcp`, helper `$HOME/.local/share/mcp-fleet/episodic-memory/headers-helper.sh`; positive case only).
+- The `user-scope` fallback (remove manifest servers, retarget `agents/search-conversations.md` `tools:` to `mcp__episodic-memory__`) is therefore not needed.
+- Patcher integration (Task 9 Step 3) is done separately by the controller.
+
 ## Rollback
 
 `python3 scripts/manage-local-service.py rollback`
