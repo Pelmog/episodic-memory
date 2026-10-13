@@ -1,0 +1,6 @@
+Found 1 relevant conversation:
+
+1. [baseline-project, 2026-01-02]
+   "How do I rotate the zebra widget cache safely?"
+   Lines 1-2 in <ROOT>/archive/baseline-project/session.jsonl (3KB, 6 lines)
+

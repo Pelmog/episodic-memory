@@ -1,0 +1,28 @@
+{
+  "results": [
+    {
+      "exchange": {
+        "id": "<ID>",
+        "project": "baseline-project",
+        "timestamp": "2026-01-02T03:02:00.000Z",
+        "userMessage": "How do I rotate the zebra widget cache safely?",
+        "assistantMessage": "Rotate the zebra widget cache by draining writers first, then swapping the cache directory atomically.",
+        "archivePath": "<ROOT>/archive/baseline-project/session.jsonl",
+        "lineStart": 1,
+        "lineEnd": 2,
+        "isSidechain": false,
+        "harness": "claude",
+        "sessionId": "b1a2c3d4-0000-4000-8000-00000000aaaa",
+        "cwd": "/Users/testuser/projects/baseline-project",
+        "gitBranch": "main",
+        "claudeVersion": "1.0.119",
+        "agentVersion": "1.0.119",
+        "model": "claude-opus-4-1-20250805",
+        "thinkingDisabled": false
+      },
+      "snippet": "How do I rotate the zebra widget cache safely?"
+    }
+  ],
+  "count": 1,
+  "mode": "text"
+}

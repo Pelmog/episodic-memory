@@ -1,0 +1,28 @@
+# Conversation
+
+## Metadata
+
+**Session ID:** b1a2c3d4-0000-4000-8000-00000000aaaa
+
+**Git Branch:** main
+
+**Working Directory:** /Users/testuser/projects/baseline-project
+
+**Claude Code Version:** 1.0.119
+
+---
+
+## Messages
+
+### **User** (1/2/2026, 3:01:00 AM) {#00000000-0000-4000-8000-000000000001}
+
+How do I rotate the zebra widget cache safely?
+
+### **Agent** (1/2/2026, 3:02:00 AM) {#00000000-0000-4000-8000-000000000002}
+
+Rotate the zebra widget cache by draining writers first, then swapping the cache directory atomically.
+
+### **User** (1/2/2026, 3:03:00 AM) {#00000000-0000-4000-8000-000000000003}
+
+What about the quokka retry policy?
+
