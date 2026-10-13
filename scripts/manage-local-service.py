@@ -189,7 +189,12 @@ class Target:
     def write(self, entry):
         raw = self.path.read_text()
         if self.kind == "toml":
-            atomic_write(self.path, _replace_block(raw, entry).encode())
+            mode = stat_mode(self.path)
+            if "http_headers" in entry and mode & 0o077:
+                # The block now holds the bearer token: never leave it group/world readable.
+                mode = 0o600
+                print(f"tightened {self.path} permissions to 0600 (it now holds the service bearer token)")
+            atomic_write(self.path, _replace_block(raw, entry).encode(), mode)
         elif self.kind == "text":
             atomic_write(self.path, entry.encode())
         else:
@@ -301,6 +306,13 @@ class Switcher:
                                              "restore it manually or roll back first")
                     before, after = None, None
                 else:
+                    # "Already switched" means exactly the recorded switched entry; anything else is drift.
+                    if current != prior["after_entry"]:
+                        raise PreflightError(f"{t.path}: episodic-memory entry differs from the recorded switched "
+                                             "entry (drift); inspect it, then roll back or restore it manually")
+                    if t.kind == "toml" and f"Bearer {token}" not in current:
+                        raise PreflightError(f"{t.path}: switched block carries a bearer that is not the current "
+                                             "token; roll back and switch again")
                     before, after = prior["before_entry"], prior["after_entry"]
             plan.append({"target": t, "before": before, "after": after, "done": done})
         return plan
@@ -336,17 +348,45 @@ class Switcher:
                 t.write(item["after"])
                 edited.append(item)
         except BaseException as exc:
-            problems = []
+            problems, unresolved = [], []
             for item in reversed(edited):
+                t = item["target"]
                 try:
-                    item["target"].write(item["before"])
+                    current = t.read()
+                    if current == item["before"]:
+                        continue
+                    if current != item["after"]:
+                        # Edited by someone else after our write: never overwrite it.
+                        problems.append(f"{t.path}: changed after the switch; left as is")
+                        unresolved.append(str(t.path))
+                        continue
+                    t.write(item["before"])
                 except Exception as inner:  # noqa: BLE001
-                    problems.append(f"{item['target'].path}: {inner}")
-            record["active"] = False
+                    problems.append(f"{t.path}: {inner}")
+                    unresolved.append(str(t.path))
+            # The record stays active while any recorded file is still switched (or its
+            # restoration failed), so rollback can still finish the job.
+            record["active"] = bool(unresolved) or self._any_switched(record["files"])
+            record["unresolved"] = unresolved
             record["failed"] = f"{type(exc).__name__}: {exc}" + (f" (restore problems: {problems})" if problems else "")
             save_record(record)
+            if record["active"]:
+                raise RuntimeError(f"switch failed; the record stays active, run rollback to finish: {record['failed']}") from exc
             raise RuntimeError(f"switch failed and was rolled back: {record['failed']}") from exc
         print(f"switched {len(edited)} file(s) to the shared service ({self.mode}); new sessions pick it up")
+
+    @staticmethod
+    def _any_switched(files):
+        """True if any recorded file still holds its switched entry."""
+        for path, info in files.items():
+            if info["after_entry"] == info["before_entry"]:
+                continue
+            try:
+                if Target.from_record(path, info).read() == info["after_entry"]:
+                    return True
+            except (OSError, ValueError):
+                continue
+        return False
 
     def _backup(self, t):
         EVIDENCE.mkdir(parents=True, exist_ok=True)
@@ -432,14 +472,16 @@ def install():
 
     run(["npm", "install", "--no-package-lock"])
     run(["npm", "run", "build"])
-    run(["npm", "test"])
     run([str(NODE), "-e", NATIVE_PROBE, str(REPO / "package.json")], stdout=subprocess.DEVNULL)
 
+    # Seed and validate the model cache before the test suite: embedding tests need it,
+    # and the shared service's workers load it offline-only.
     cache_rel = Path("node_modules/@huggingface/transformers/.cache/Xenova/bge-small-en-v1.5")
     dest = REPO / cache_rel
     if not dest.exists():
         shutil.copytree(registered_plugin_dir() / cache_rel, dest)
     run([str(NODE), "-e", MODEL_OFFLINE_CHECK % json.dumps(model_dtype())], stdout=subprocess.DEVNULL)
+    run(["npm", "test"])
 
     plist = {"Label": LABEL, "ProgramArguments": [str(NODE), str(REPO / "dist/mcp-server.js"), "--http"],
              "WorkingDirectory": str(REPO),
@@ -456,8 +498,15 @@ def install():
     probe(wait=90)
 
 
+# Per-session overrides the launchd service never sees; the probe drops them so it checks
+# the same index (embedding version) the service reads.
+SESSION_ONLY_ENV = ("EPISODIC_MEMORY_CONFIG_DIR", "XDG_CONFIG_HOME", "EPISODIC_MEMORY_DB_PATH",
+                    "PERSONAL_SUPERPOWERS_DIR", "TEST_DB_PATH")
+
+
 def probe(wait=0):
-    env = {**runtime_env(), "EPISODIC_MEMORY_HTTP_TOKEN_FILE": str(TOKEN), "EPISODIC_MEMORY_HTTP_URL": URL}
+    env = {k: v for k, v in runtime_env().items() if k not in SESSION_ONLY_ENV}
+    env.update({"EPISODIC_MEMORY_HTTP_TOKEN_FILE": str(TOKEN), "EPISODIC_MEMORY_HTTP_URL": URL})
     deadline = time.time() + wait
     while True:
         r = subprocess.run([str(NODE), "scripts/probe-live.mjs"], cwd=REPO, env=env, capture_output=True, text=True, timeout=180)

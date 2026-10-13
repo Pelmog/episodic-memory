@@ -1,6 +1,8 @@
 """Tests for manage-local-service.py. Everything runs against a temporary HOME (EM_TEST_HOME);
 install/probe side effects (launchctl, npm, node) are never exercised here."""
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -47,14 +49,14 @@ def jread(path):
     return json.loads(Path(path).read_text())
 
 
-def check_replace_failing(nth):
-    """os.replace wrapper that raises on the nth replace that is not the switch record or a backup."""
+def check_replace_failing(*nths):
+    """os.replace wrapper that raises on the nth replaces that are not the switch record or a backup."""
     real, state = os.replace, {"n": 0}
 
     def fake(src, dst, *a, **k):
         if Path(dst) != mls.RECORD and mls.EVIDENCE not in Path(dst).parents:
             state["n"] += 1
-            if state["n"] == nth:
+            if state["n"] in nths:
                 raise OSError("injected failure")
         return real(src, dst, *a, **k)
     return fake
@@ -166,6 +168,104 @@ class ManifestSwitchTests(Base):
         self.assertFalse(rec["active"])
         self.assertIn("injected failure", rec["failed"])
 
+    def test_failed_recovery_keeps_record_active_and_rollback_completes(self):
+        before = self.all_bytes()
+        # 2nd replace = .mcp.json switch fails; 3rd = restoring config.toml fails too.
+        with mock.patch.object(mls.os, "replace", check_replace_failing(2, 3)):
+            with self.assertRaises(RuntimeError):
+                mls.Switcher("plugin-manifest").apply()
+        self.assertIn("Bearer", mls.CODEX_CONFIG.read_text())  # still switched
+        rec = jread(mls.RECORD)
+        self.assertTrue(rec["active"])
+        self.assertIn("injected failure", rec["failed"])
+        self.assertEqual(rec["unresolved"], [str(mls.CODEX_CONFIG)])
+        mls.Switcher("plugin-manifest").rollback()
+        self.assertEqual(self.all_bytes(), before)
+        self.assertFalse(jread(mls.RECORD)["active"])
+
+    def test_recovery_leaves_a_later_edit_alone(self):
+        real_write, calls = mls.Target.write, {"n": 0}
+
+        def write(target, entry):
+            calls["n"] += 1
+            if calls["n"] == 2:  # someone edits the already-switched Codex block, then the 2nd write fails
+                mls.CODEX_CONFIG.write_text(mls.CODEX_CONFIG.read_text().replace("120.0", "300.0"))
+                raise OSError("injected failure")
+            return real_write(target, entry)
+        with mock.patch.object(mls.Target, "write", write):
+            with self.assertRaises(RuntimeError):
+                mls.Switcher("plugin-manifest").apply()
+        text = mls.CODEX_CONFIG.read_text()
+        self.assertIn("300.0", text)
+        self.assertIn("Bearer", text)
+        rec = jread(mls.RECORD)
+        self.assertTrue(rec["active"])
+        self.assertEqual(rec["unresolved"], [str(mls.CODEX_CONFIG)])
+
+    def test_failed_rerun_keeps_record_active_while_files_stay_switched(self):
+        mls.Switcher("plugin-manifest").apply()
+        # A newer plugin version appears with the stdio form; the re-run fails on its first write.
+        v2 = self.plugin.parent / "1.1.0"
+        write(v2 / ".mcp.json", json.dumps({"mcpServers": {"episodic-memory": dict(STDIO)}}))
+        write(v2 / ".claude-plugin/plugin.json", json.dumps({"name": "episodic-memory", "mcpServers": {"episodic-memory": dict(STDIO)}}))
+        data = jread(mls.INSTALLED_PLUGINS)
+        data["plugins"]["episodic-memory@superpowers-marketplace"][0]["installPath"] = str(v2)
+        write(mls.INSTALLED_PLUGINS, json.dumps(data))
+        with mock.patch.object(mls.os, "replace", check_replace_failing(1)):
+            with self.assertRaises(RuntimeError):
+                mls.Switcher("plugin-manifest").apply()
+        rec = jread(mls.RECORD)
+        self.assertTrue(rec["active"])  # Codex and the 1.0.0 manifests are still switched
+        self.assertEqual(rec.get("unresolved"), [])
+        self.assertIn("Bearer", mls.CODEX_CONFIG.read_text())
+
+    def test_rerun_with_drifted_codex_block_is_refused(self):
+        mls.Switcher("plugin-manifest").apply()
+        for old, new in (("120.0", "300.0"), (TOKEN, "u" * 48)):
+            switched = mls.CODEX_CONFIG.read_text()
+            mls.CODEX_CONFIG.write_text(switched.replace(old, new))
+            before = self.all_bytes()
+            rec = mls.RECORD.read_bytes()
+            with self.assertRaises(mls.PreflightError) as cm:
+                mls.Switcher("plugin-manifest").apply()
+            self.assertIn("config.toml", str(cm.exception))
+            self.assertEqual(self.all_bytes(), before)
+            self.assertEqual(mls.RECORD.read_bytes(), rec)
+            mls.CODEX_CONFIG.write_text(switched)
+
+    def test_rerun_after_token_rotation_is_refused(self):
+        mls.Switcher("plugin-manifest").apply()
+        write(mls.TOKEN, "n" * 48)
+        before = self.all_bytes()
+        with self.assertRaises(mls.PreflightError) as cm:
+            mls.Switcher("plugin-manifest").apply()
+        self.assertIn("config.toml", str(cm.exception))
+        self.assertEqual(self.all_bytes(), before)
+
+    def test_rerun_with_drifted_manifest_is_refused(self):
+        mls.Switcher("plugin-manifest").apply()
+        d = jread(self.plugin / ".mcp.json")
+        d["mcpServers"]["episodic-memory"]["timeout"] = 5
+        write(self.plugin / ".mcp.json", json.dumps(d))
+        with self.assertRaises(mls.PreflightError) as cm:
+            mls.Switcher("plugin-manifest").apply()
+        self.assertIn(".mcp.json", str(cm.exception))
+
+    def test_codex_config_is_tightened_to_0600_with_notice(self):
+        mls.CODEX_CONFIG.chmod(0o644)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mls.Switcher("plugin-manifest").apply()
+        self.assertEqual(stat.S_IMODE(mls.CODEX_CONFIG.stat().st_mode), 0o600)
+        self.assertIn("0600", out.getvalue())
+        self.assertNotIn(TOKEN, out.getvalue())
+
+    def test_codex_config_at_0600_gets_no_notice(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mls.Switcher("plugin-manifest").apply()
+        self.assertNotIn("0600", out.getvalue())
+
     def test_preflight_rejects_unparseable_or_unexpected(self):
         (self.plugin / ".mcp.json").write_text("{not json")
         before = self.all_bytes()
@@ -250,6 +350,50 @@ class RollbackTests(Base):
         mls.Switcher("plugin-manifest").rollback()
         self.assertEqual(jread(v2 / ".mcp.json")["mcpServers"]["episodic-memory"], STDIO)
         self.assertFalse(jread(mls.RECORD)["active"])
+
+
+class InstallOrderTests(Base):
+    def test_model_cache_is_seeded_and_validated_before_npm_test(self):
+        mls.NODE.parent.mkdir(parents=True, exist_ok=True)
+        mls.NODE.write_text("")
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            return mls.subprocess.CompletedProcess(cmd, 0, "", "")
+        with mock.patch.object(mls.subprocess, "run", fake_run), \
+                mock.patch.object(mls, "probe", lambda wait=0: calls.append(["probe"])), \
+                mock.patch.object(mls.shutil, "copytree", lambda src, dst: calls.append(["copytree"])), \
+                mock.patch.object(mls, "REPO", Path(_TMP) / "repo"), \
+                mock.patch.object(mls, "model_dtype", lambda: "q8"):
+            mls.install()
+
+        def index(pred):
+            return next(i for i, c in enumerate(calls) if pred(c))
+        npm_test = index(lambda c: c[:2] == ["npm", "test"])
+        offline = index(lambda c: len(c) > 2 and c[1] == "-e" and "allowRemoteModels=false" in c[2])
+        seeded = index(lambda c: c == ["copytree"])
+        self.assertLess(seeded, offline)
+        self.assertLess(offline, npm_test)
+        self.assertLess(index(lambda c: c[:2] == ["npm", "run"]), seeded)
+        self.assertIn("launchctl", [c[0] for c in calls])  # intercepted by the fake, never run
+
+
+class ProbeEnvTests(Base):
+    def test_probe_resolves_the_index_like_the_service(self):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen.update(kw["env"])
+            return mls.subprocess.CompletedProcess(cmd, 0, '{"ok":true}', "")
+        session = {"EPISODIC_MEMORY_CONFIG_DIR": "/x", "XDG_CONFIG_HOME": "/y", "EPISODIC_MEMORY_DB_PATH": "/z",
+                   "PERSONAL_SUPERPOWERS_DIR": "/w", "TEST_DB_PATH": "/v"}
+        with mock.patch.dict(os.environ, session), mock.patch.object(mls.subprocess, "run", fake_run), \
+                contextlib.redirect_stdout(io.StringIO()):
+            mls.probe()
+        # Compare key names only: never let a failure message print environment values.
+        self.assertEqual(sorted(k for k in session if k in seen), [])
+        self.assertEqual(seen.get("EPISODIC_MEMORY_HTTP_URL"), mls.URL)
 
 
 class UserScopeTests(Base):

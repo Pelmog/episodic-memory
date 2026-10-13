@@ -1,6 +1,12 @@
 // Read-only probe of the shared episodic-memory HTTP service.
 // Prints only counts, latencies and ok/fail. Never prints the token or transcript text.
+// Checks, in order: the index's embedding version matches this build (read-only, local
+// DB path from the environment, like the service), then for a modern and a legacy client:
+// tools/list equals the baseline, a text search, a read of its first hit, and a
+// default-mode search (vector + text, so the embedding model must work).
 import fs from 'node:fs/promises';
+import { openReadOnlyDatabase } from '../dist/db.js';
+import { EMBEDDING_VERSION } from '../dist/embedding-migration.js';
 import { Client as ModernClient, StreamableHTTPClientTransport as ModernTransport } from '@modelcontextprotocol/client';
 import { Client as LegacyClient } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport as LegacyTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -30,11 +36,32 @@ async function exercise(label, client, transport) {
   }));
   if (read.isError) throw new Error(`${label}: read returned an error`);
   const readOk = true;
-  return { client: label, tools: list.tools.length, listMs, searchResults: results.length, searchMs, readOk, readMs };
+  // No `mode`: the default ("both") runs the vector search, which needs the embedding model.
+  const [vector, defaultSearchMs] = await timed(() => client.callTool({
+    name: 'search', arguments: { query: process.env.EPISODIC_MEMORY_PROBE_QUERY ?? 'episodic memory', limit: 3, response_format: 'json' },
+  }));
+  if (vector.isError) throw new Error(`${label}: default-mode search returned an error`);
+  const defaultSearchResults = (JSON.parse(vector.content[0].text).results ?? []).length;
+  return { client: label, tools: list.tools.length, listMs, searchResults: results.length, searchMs, readOk, readMs, defaultSearchResults, defaultSearchMs };
+}
+
+/** MAX(embedding_version) of the index the service reads, opened read-only. */
+function indexEmbeddingVersion() {
+  const db = openReadOnlyDatabase();
+  try {
+    return db.prepare('SELECT MAX(embedding_version) AS v FROM exchanges').get().v ?? null;
+  } finally {
+    db.close();
+  }
 }
 
 const clients = [];
+let embeddingVersion;
 try {
+  embeddingVersion = { index: indexEmbeddingVersion(), build: EMBEDDING_VERSION };
+  if (embeddingVersion.index !== EMBEDDING_VERSION) {
+    throw new Error(`index embedding version ${embeddingVersion.index} differs from this build's ${EMBEDDING_VERSION}; run "episodic-memory sync" with this build first`);
+  }
   const modern = new ModernClient({ name: 'em-probe-modern', version: '1' }, { versionNegotiation: { mode: { pin: '2026-07-28' } } });
   const modernTransport = new ModernTransport(url, { requestInit: { headers } });
   clients.push(modern);
@@ -44,9 +71,9 @@ try {
   clients.push(legacy);
   await legacy.connect(legacyTransport);
   const report = [await exercise('modern', modern, modernTransport), await exercise('legacy', legacy, legacyTransport)];
-  console.log(JSON.stringify({ ok: true, catalogMatchesBaseline: true, clients: report }));
+  console.log(JSON.stringify({ ok: true, catalogMatchesBaseline: true, embeddingVersion, clients: report }));
 } catch (error) {
-  console.log(JSON.stringify({ ok: false, reason: String(error?.message ?? error).slice(0, 200) }));
+  console.log(JSON.stringify({ ok: false, reason: String(error?.message ?? error).slice(0, 200), embeddingVersion }));
   process.exitCode = 1;
 } finally {
   await Promise.allSettled(clients.map((c) => c.close()));

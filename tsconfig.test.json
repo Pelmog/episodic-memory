@@ -14,7 +14,8 @@
     "test/http.test.ts",
     "test/http-startup.test.ts",
     "test/http-bundle.test.ts",
-    "test/tool-worker-exit.test.ts"
+    "test/tool-worker-exit.test.ts",
+    "test/probe-live.test.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }

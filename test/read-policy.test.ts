@@ -140,31 +140,56 @@ describe('search -> read roundtrip', () => {
 });
 
 describe('audit-archive-paths script', () => {
-  it('exits 1 with correct counts when a stored path is outside the roots', () => {
-    const repo = fileURLToPath(new URL('..', import.meta.url));
+  const repo = fileURLToPath(new URL('..', import.meta.url));
+
+  /** Builds a minimal index whose exchanges.archive_path values are `paths`, then runs the audit. */
+  function audit(r: string, paths: string[]) {
+    const dbFile = join(r, 'db.sqlite');
+    const setup = spawnSync(process.execPath, ['-e', `
+      const D = require('better-sqlite3'); const d = new D(${JSON.stringify(dbFile)});
+      d.exec('CREATE TABLE exchanges(id INTEGER PRIMARY KEY, archive_path TEXT)');
+      const i = d.prepare('INSERT INTO exchanges(archive_path) VALUES (?)');
+      for (const p of ${JSON.stringify(paths)}) i.run(p);`], { cwd: repo, encoding: 'utf8' });
+    expect(setup.status, setup.stderr).toBe(0);
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (v !== undefined && !k.startsWith('EPISODIC_MEMORY_') && !k.startsWith('TEST_')) env[k] = v;
+    }
+    Object.assign(env, { EPISODIC_MEMORY_CONFIG_DIR: join(r, 'config'), TEST_DB_PATH: dbFile, TEST_ARCHIVE_DIR: join(r, 'archive'), TEST_PROJECTS_DIR: join(r, 'archive') });
+    return spawnSync(process.execPath, [join(repo, 'node_modules/tsx/dist/cli.mjs'), 'scripts/audit-archive-paths.mjs'], { cwd: repo, env, encoding: 'utf8' });
+  }
+
+  function tempRoot(): string {
     const r = realpathSync(mkdtempSync(join(tmpdir(), 'em-audit-')));
+    for (const d of ['archive/proj', 'outside', 'config']) mkdirSync(join(r, d), { recursive: true });
+    writeFileSync(join(r, 'archive/proj/a.jsonl'), line);
+    writeFileSync(join(r, 'outside/b.jsonl'), line);
+    return r;
+  }
+
+  it('exits 1 with correct counts when a stored path is outside the roots', () => {
+    const r = tempRoot();
     try {
-      for (const d of ['archive/proj', 'outside', 'config']) mkdirSync(join(r, d), { recursive: true });
-      writeFileSync(join(r, 'archive/proj/a.jsonl'), line);
-      writeFileSync(join(r, 'outside/b.jsonl'), line);
-      const dbFile = join(r, 'db.sqlite');
-      const setup = spawnSync(process.execPath, ['-e', `
-        const D = require('better-sqlite3'); const d = new D(${JSON.stringify(dbFile)});
-        d.exec('CREATE TABLE exchanges(id INTEGER PRIMARY KEY, archive_path TEXT)');
-        const i = d.prepare('INSERT INTO exchanges(archive_path) VALUES (?)');
-        i.run(${JSON.stringify(join(r, 'archive/proj/a.jsonl'))}); i.run(${JSON.stringify(join(r, 'outside/b.jsonl'))});`], { cwd: repo, encoding: 'utf8' });
-      expect(setup.status, setup.stderr).toBe(0);
-      const env: Record<string, string> = {};
-      for (const [k, v] of Object.entries(process.env)) {
-        if (v !== undefined && !k.startsWith('EPISODIC_MEMORY_') && !k.startsWith('TEST_')) env[k] = v;
-      }
-      Object.assign(env, { EPISODIC_MEMORY_CONFIG_DIR: join(r, 'config'), TEST_DB_PATH: dbFile, TEST_ARCHIVE_DIR: join(r, 'archive'), TEST_PROJECTS_DIR: join(r, 'archive') });
-      const out = spawnSync(process.execPath, [join(repo, 'node_modules/tsx/dist/cli.mjs'), 'scripts/audit-archive-paths.mjs'], { cwd: repo, env, encoding: 'utf8' });
+      const out = audit(r, [join(r, 'archive/proj/a.jsonl'), join(r, 'outside/b.jsonl')]);
       expect(out.status, out.stderr).toBe(1);
       expect(out.stdout).toContain('distinct archive paths: 2');
       expect(out.stdout).toContain('not readable under policy: 1');
+      expect(out.stdout).toContain('outside roots: 1');
       expect(out.stdout).toContain(join(r, 'outside'));
       expect(out.stdout).not.toContain('a.jsonl');
+    } finally {
+      rmSync(r, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  it('reports missing files separately and exits 0 when nothing is outside the roots', () => {
+    const r = tempRoot();
+    try {
+      const out = audit(r, [join(r, 'archive/proj/a.jsonl'), join(r, 'archive/proj/gone.jsonl')]);
+      expect(out.status, out.stdout + out.stderr).toBe(0);
+      expect(out.stdout).toContain('outside roots: 0');
+      expect(out.stdout).toContain('missing files: 1');
+      expect(out.stdout).not.toContain('gone.jsonl');
     } finally {
       rmSync(r, { recursive: true, force: true });
     }
