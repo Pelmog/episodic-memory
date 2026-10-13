@@ -3,9 +3,21 @@
 One long-lived `node dist/mcp-server.js --http` process serves the `search` and
 `read` tools to every Claude Code and Codex session, instead of one stdio server
 (plus its embedding model) per session. It speaks MCP 2026-07-28 with the
-official SDK (`@modelcontextprotocol/server` 2.3.1); 2025 clients get the SDK's
-stateless legacy fallback (no session ids, `maxSubscriptions: 0`). The stdio
-entrypoint is unchanged and remains the default without `--http`.
+official SDK (`@modelcontextprotocol/server` 2.3.1). The stdio entrypoint is
+unchanged and remains the default without `--http`.
+
+Two protocol legs, both stateless (no session ids):
+
+- **Modern (2026-07-28) clients** go through the SDK's `createMcpHandler` with
+  `legacy: 'reject'` and `maxSubscriptions: 0`.
+- **2025-era clients** (detected with `isLegacyRequest`) go through a hand-built
+  leg in `src/http.ts`: a per-request `WebStandardStreamableHTTPServerTransport`
+  with `sessionIdGenerator: undefined` and `enableJsonResponse: true`. It exists
+  because the SDK's built-in legacy fallback answers with an SSE stream *before*
+  the tool handler runs, so a late `PoolBusyError` could no longer become HTTP 503.
+  In JSON mode the response is produced only after the tool settles. A client
+  disconnect is raced against the exchange (it never settles on its own in JSON
+  mode) so the admission slot is always released.
 
 Tool names, descriptions, input schemas, annotations and output text are
 byte-identical to the stdio server (fixtures in `test/fixtures/mcp-baseline/`).
@@ -16,23 +28,41 @@ byte-identical to the stdio server (fixtures in `test/fixtures/mcp-baseline/`).
   `POST /mcp` only. Every request needs `Authorization: Bearer <token>`, read from
   `EPISODIC_MEMORY_HTTP_TOKEN_FILE` (regular file, owned by the current uid,
   mode exactly 0600, at least 32 bytes, no whitespace). Auth runs before the body
-  is read. Body limit 1 MiB; at most 16 admitted requests, further ones get 503.
+  is read. Body limit 1 MiB. The body is size-checked and parsed before admission:
+  at most 16 concurrent requests containing a `tools/call` (a batch with any
+  `tools/call` counts as one) and, separately, at most 64 other requests
+  (initialize, notifications, `tools/list`, ping), so new sessions can still
+  connect while searches run; beyond either cap the answer is 503 with
+  `Retry-After: 1`. Concurrent body reads are bounded by the sum (80).
   No health or unauthenticated endpoint.
 - **Worker pool.** Tool calls run on `EPISODIC_MEMORY_HTTP_WORKERS` worker threads
   (default 3, range 1-8; `dist/tool-worker.js`). Each worker owns its own
   embedding model (warmed up in the background, bounded at 60 s) and its own
-  index connection. A busy pool queues (bounded) and then answers 503.
+  index connection. A busy pool queues (bounded) and then answers 503. Workers
+  load the model offline-only (`allowRemoteModels = false`): a missing or broken
+  cache fails fast instead of waiting on the network (stdio and CLI keep the
+  library default).
 - **Read-only index.** Workers open the SQLite index read-only and never migrate
   it. Indexing and sync stay with the normal sync/index CLIs and hooks; the
   service never writes the index or the archive.
 - **`read` restriction.** The shared `read` tool only opens existing `.jsonl`
   files whose real path (symlinks resolved) is inside the conversation archive
   or a configured transcript source directory. Anything else is an error
-  (`src/read-policy.ts`).
+  (`src/read-policy.ts`). The root check runs before any existence or type
+  check, so every path outside the roots gets the same error whether or not it
+  exists.
 - **Deadlines.** Each tool call has a deadline timed from dispatch
   (`EPISODIC_MEMORY_TOOL_DEADLINE_MS`, default 100000). On expiry, client
   cancel or disconnect the worker is retired and replaced (live workers are
-  capped at twice the pool size) and the caller gets a tool error.
+  capped at twice the pool size) and the caller gets a tool error. Workers are
+  never terminated (that aborts the process mid ONNX load); a retired worker
+  exits itself after its in-flight call settles (bounded at 30 s) and any model
+  load finishes.
+- **Watchdog.** If a retiring worker is still alive 2 × the deadline after it
+  was retired, or calls are queued while no worker slot is usable at the cap
+  for 2 × the deadline, the service logs `episodic-memory tool pool wedged (...)`
+  and exits with code 1; launchd `KeepAlive` restarts it (after `ThrottleInterval`).
+  In-flight requests on that process fail; clients retry.
 - **Shutdown.** SIGTERM/SIGINT stop accepting, drain within 10 s and exit 0.
   Ready line on stderr: `episodic-memory HTTP ready on 127.0.0.1:<port> (<n> workers)`.
 
@@ -48,6 +78,14 @@ byte-identical to the stdio server (fixtures in `test/fixtures/mcp-baseline/`).
 - A legacy JSON-RPC batch where one call is rejected busy drops its sibling
   results (read-only tools; retry the batch).
 - Claude never stores the token (see below); Codex does, in its 0600 config.
+- The service runs with the plist environment only (`HOME`, `PATH`, token file,
+  port). Per-session `EPISODIC_MEMORY_CONFIG_DIR`, `XDG_CONFIG_HOME`,
+  `EPISODIC_MEMORY_DB_PATH` and `PERSONAL_SUPERPOWERS_DIR` are **ignored**: a
+  session that sets them gets the default index through the service, unlike its
+  old stdio server. They must be unset for parity (the probe drops them so it
+  checks the index the service reads).
+- Headless `claude` runs with `--strict-mcp-config` do not see plugin MCP
+  servers, so they have no episodic-memory tools (see below).
 
 ## Local deployment
 
@@ -68,9 +106,9 @@ All via `python3 scripts/manage-local-service.py <command>`. None prints the tok
 
 | Command | What it does |
 |---|---|
-| `install` | Checks the pinned Node, creates the state dir (0700), token (created once, never overwritten), log and headers helper; runs `npm install --no-package-lock` (no lockfile exists), `npm run build`, `npm test`; native check (better-sqlite3 + sqlite-vec); copies the embedding model cache from the registered plugin install if absent and validates it by an offline load; writes the plist, `launchctl bootout` (ignored) and `bootstrap gui/<uid>`; then probes (waits up to 90 s). |
-| `probe` | Runs `scripts/probe-live.mjs` against the service with a modern and a legacy client: `tools/list` must equal the baseline catalog (name, description, schema, annotations), then a `search` and a `read` of the first hit (lines 1-5). Prints only counts, latencies and `ok`/`fail`. |
-| `switch-clients [--claude-mode plugin-manifest\|user-scope]` | Requires a passing probe. Preflight reads and parses every target and checks each is the expected pre-switch form (or already switched, so a re-run is a no-op); writes the 0600 record and backups before editing; edits are atomic and any failure restores the files already edited and marks the record `active: false` with `failed`. |
+| `install` | Checks the pinned Node, creates the state dir (0700), token (created once, never overwritten), log and headers helper; runs `npm install --no-package-lock` (no lockfile exists) and `npm run build`; native check (better-sqlite3 + sqlite-vec); copies the embedding model cache from the registered plugin install if absent and validates it by an offline load; then `npm test` (embedding tests need the cache); writes the plist, `launchctl bootout` (ignored) and `bootstrap gui/<uid>`; then probes (waits up to 90 s). |
+| `probe` | Runs `scripts/probe-live.mjs` (session-only index overrides removed from its env). First, read-only: the index's `MAX(embedding_version)` must equal this build's `EMBEDDING_VERSION` (`src/embedding-migration.ts`); a mismatch means the index needs `episodic-memory sync` with this build (the service never migrates). Then with a modern and a legacy client: `tools/list` must equal the baseline catalog (name, description, schema, annotations), a text `search`, a `read` of the first hit (lines 1-5), and a default-mode `search` (no `mode`, i.e. vector + text, so the embedding model must work). Prints only counts, versions, latencies and `ok`/`fail`. |
+| `switch-clients [--claude-mode plugin-manifest\|user-scope]` | Requires a passing probe. Preflight reads and parses every target and checks each is the expected pre-switch form, or already switched, which means exactly equal to the recorded switched entry (and, for Codex, carrying the current token); anything else is drift and is refused naming the file. A re-run of a complete switch is a no-op. Writes the 0600 record and backups before editing; edits are atomic. On failure, each file already edited is restored only if it still holds the switched entry (a later edit is left alone); if every recorded file is back to its original the record becomes `active: false` with `failed`, otherwise it stays `active: true` with `failed` and an `unresolved` list, and `rollback` finishes the job. The Codex config is set to 0600 when the bearer is written (a notice is printed if it was wider). |
 | `rollback` | Restores recorded entries; see below. |
 
 `switch-clients` targets:
@@ -90,8 +128,50 @@ All via `python3 scripts/manage-local-service.py <command>`. None prints the tok
   `mcp__plugin_episodic-memory_episodic-memory__` to `mcp__episodic-memory__`.
   All of it is recorded and rolled back.
 
-The plugin patcher re-applies the switch to newly installed plugin versions
-while the record says `active: true`, and adds those files to the record.
+**Persistence across plugin upgrades is not in place yet.** A plugin upgrade
+installs a new version directory with the stdio manifests, and Claude sessions
+started after it use stdio again until the switch is re-applied. The planned
+plugin patcher (outside this repo, pending) will re-apply the switch to newly
+installed plugin versions while the record says `active: true`. Until then,
+re-run `switch-clients` after a plugin upgrade (the new version's files are added
+to the record; already-switched files are left as they are).
+
+Record format (`switch-record.json`, 0600) that the patcher must preserve and extend:
+
+```json
+{
+  "active": true,
+  "mode": "plugin-manifest",
+  "created": "<ISO-8601 UTC, from the first switch>",
+  "files": {
+    "/abs/path/to/plugin/<version>/.mcp.json": {
+      "before_entry": {"command": "...", "args": ["..."]},
+      "after_entry": {"type": "http", "url": "http://127.0.0.1:8734/mcp", "headersHelper": "<state>/headers-helper.sh"},
+      "backup_path": "<evidence>/backups/<hash>-.mcp.json",
+      "kind": "json",
+      "key": ["mcpServers", "episodic-memory"]
+    }
+  }
+}
+```
+
+The patcher keeps the top-level `active`, `mode` and `created` unchanged and adds
+one `files[<absolute path>]` entry per edited file (`kind: "json"`, `key:
+["mcpServers","episodic-memory"]`, `before_entry` = the entry it replaced,
+`after_entry` = the entry it wrote, `backup_path` = a 0600 copy of the original
+file or `null`). After a failed switch the record may also carry `failed` and
+`unresolved`; leave them for `rollback`.
+
+## After a rebuild
+
+The service runs `dist/` from this worktree and loads it only at start. After any
+`npm run build` (or `install`), restart it so it serves the new build:
+
+```
+launchctl kickstart -k gui/$(id -u)/com.local.episodic-memory-v2
+```
+
+then `python3 scripts/manage-local-service.py probe`.
 
 ## If the service is down at Claude session start
 
@@ -148,9 +228,17 @@ is written. On success the record becomes `active: false` so the patcher stops
 re-applying. The service is left running for connected HTTP clients; once they
 have reconnected to stdio, stop it with
 `launchctl bootout gui/$(id -u)/com.local.episodic-memory-v2`.
-Original files are also backed up under the evidence directory.
+Restored JSON files are re-serialised (`json.dumps`, 2-space indent), so their
+formatting can differ from the original even though the content is identical;
+the byte-exact originals are the 0600 backups under the evidence directory
+(`backup_path` in the record). A record left `active: true` by a failed switch
+(see `switch-clients`) is completed by the same command.
 
 ## Tests
 
 `python3 -m unittest scripts/test_manage_local_service.py` (temporary HOME via
 `EM_TEST_HOME`; no launchctl, npm or real config is touched) and `npm test`.
+
+`npx tsx scripts/audit-archive-paths.mjs` checks every stored archive path
+against the `read` policy: it exits 1 only if a path is outside the readable
+roots; missing files are reported separately and do not fail it.
