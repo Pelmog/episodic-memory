@@ -22,17 +22,39 @@ const EXIT_MESSAGE = { type: 'exit' };
  * Never `worker.terminate()`: terminating a worker while onnxruntime-node has
  * async native work in flight (model load or an embedding) aborts the whole
  * process with SIGABRT, whereas the worker's own process.exit() is clean.
+ *
+ * A retiring worker can stay busy for seconds (a sync SQLite query runs to
+ * completion), so live workers (active + retiring) are capped at 2 × size.
+ * At the cap a deadline/cancel still answers at once, but the slot stays empty
+ * (calls queue, PoolBusyError past maxQueue) until a retiring worker exits.
  */
 export function createToolPool(options) {
     const { workerPath, size, deadlineMs, maxQueue } = options;
-    const slots = Array.from({ length: size }, () => ({ worker: null, busy: null }));
+    const slots = Array.from({ length: size }, () => ({ worker: null, busy: null, awaitingCapacity: false }));
     const queue = [];
-    const exited = new Map(); // every live worker, current or retiring
+    // Every live worker (a slot's current worker or a retiring one) → resolves on its 'exit'.
+    // So live count = live.size = (slots with a worker) + (retiring workers not yet exited).
+    const live = new Map();
+    const maxLive = 2 * size;
     let nextId = 1;
     let closed = false;
+    const canSpawn = () => !closed && live.size < maxLive;
+    /** A slot can take a call now: it has a worker, or may spawn one under the cap. */
+    const usable = (s) => s.busy === null && (s.worker !== null || canSpawn());
+    function onWorkerExit(worker) {
+        live.delete(worker);
+        // Capacity freed: refill slots that were retired at the cap, then serve the queue.
+        for (const slot of slots) {
+            if (slot.awaitingCapacity && slot.worker === null && canSpawn())
+                spawn(slot);
+        }
+        dispatch();
+    }
     function spawn(slot) {
         const worker = new Worker(workerPath);
-        exited.set(worker, new Promise((resolve) => worker.once('exit', () => { exited.delete(worker); resolve(); })));
+        let exited;
+        live.set(worker, new Promise((resolve) => { exited = resolve; }));
+        slot.awaitingCapacity = false;
         worker.on('message', (reply) => {
             // Replies from a retired worker, or for a call that already settled, are stale.
             if (slot.worker === worker && slot.busy !== null && slot.busy.id === reply?.id)
@@ -49,20 +71,32 @@ export function createToolPool(options) {
             // Respawn now if a call was lost; an idle crash respawns lazily on the next dispatch,
             // so a worker that dies at startup cannot spin in a respawn loop.
             if (slot.busy) {
-                spawn(slot);
+                replace(slot);
                 finish(slot, errorResult(CRASHED));
             }
         };
         worker.on('error', lost);
-        worker.on('exit', () => lost());
+        worker.on('exit', () => {
+            lost(); // first, so dispatch below never picks this slot's dead worker
+            onWorkerExit(worker);
+            exited();
+        });
         slot.worker = worker;
         return worker;
     }
-    function retire(slot) {
-        slot.worker?.postMessage(EXIT_MESSAGE);
-        slot.worker = null;
-        if (!closed)
+    /** Give an emptied slot a new worker now, or once a retiring worker exits if at the cap. */
+    function replace(slot) {
+        if (closed)
+            return;
+        if (canSpawn())
             spawn(slot);
+        else
+            slot.awaitingCapacity = true;
+    }
+    function retire(slot) {
+        slot.worker?.postMessage(EXIT_MESSAGE); // stays in `live` until it exits
+        slot.worker = null;
+        replace(slot);
     }
     function detach(call) {
         clearTimeout(call.timer);
@@ -96,7 +130,7 @@ export function createToolPool(options) {
     }
     function dispatch() {
         while (!closed && queue.length > 0) {
-            const slot = slots.find((s) => s.busy === null);
+            const slot = slots.find(usable);
             if (!slot)
                 return;
             start(slot, queue.shift());
@@ -107,7 +141,7 @@ export function createToolPool(options) {
             return errorResult(SHUTTING_DOWN);
         if (signal.aborted)
             return errorResult(CANCELLED);
-        const idle = slots.find((s) => s.busy === null);
+        const idle = slots.find(usable);
         if (!idle && queue.length >= maxQueue)
             throw new PoolBusyError();
         return new Promise((resolve) => {
@@ -146,21 +180,22 @@ export function createToolPool(options) {
             for (const slot of slots) {
                 slot.busy = null;
                 slot.worker = null;
+                slot.awaitingCapacity = false;
             }
             for (const call of pending) {
                 detach(call);
                 call.resolve(errorResult(SHUTTING_DOWN));
             }
-            for (const worker of exited.keys())
+            for (const worker of live.keys())
                 worker.postMessage(EXIT_MESSAGE);
         }
-        await Promise.all(exited.values());
+        await Promise.all(live.values());
     }
     for (const slot of slots)
         spawn(slot);
     return {
         run,
         close,
-        stats: () => ({ busy: slots.filter((s) => s.busy !== null).length, queued: queue.length, size }),
+        stats: () => ({ busy: slots.filter((s) => s.busy !== null).length, queued: queue.length, size, live: live.size }),
     };
 }

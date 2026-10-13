@@ -57,7 +57,7 @@ describe('tool pool (fixture worker)', () => {
     expect(Date.now() - t1).toBeLessThan(1000);
     for (const r of after) expect(r.isError).toBeFalsy();
     expect(new Set(after.map(threadOf))).not.toEqual(before);
-    expect(p.stats()).toEqual({ busy: 0, queued: 0, size: 2 });
+    expect(p.stats()).toMatchObject({ busy: 0, queued: 0, size: 2 });
   });
 
   it('ignores the late reply of a retired worker', async () => {
@@ -74,7 +74,7 @@ describe('tool pool (fixture worker)', () => {
     expect(text(own)).toMatch(/^block:/);
     expect(threadOf(own)).not.toBe(retired);
     expect(Date.now() - t1).toBeGreaterThanOrEqual(880);
-    expect(p.stats()).toEqual({ busy: 0, queued: 0, size: 1 });
+    expect(p.stats()).toMatchObject({ busy: 0, queued: 0, size: 1 });
   });
 
   it('cancels a running call and replaces its worker', async () => {
@@ -99,7 +99,7 @@ describe('tool pool (fixture worker)', () => {
     const first = p.run('block', { ms: 500 }, never());
     const c = new AbortController();
     const queued = p.run('block', { ms: 3000 }, c.signal);
-    expect(p.stats()).toEqual({ busy: 1, queued: 1, size: 1 });
+    expect(p.stats()).toEqual({ busy: 1, queued: 1, size: 1, live: 1 });
     await sleep(50);
     c.abort();
     expect(await queued).toEqual(CANCELLED);
@@ -116,7 +116,7 @@ describe('tool pool (fixture worker)', () => {
     const c = new AbortController();
     c.abort();
     expect(await p.run('block', { ms: 3000 }, c.signal)).toEqual(CANCELLED);
-    expect(p.stats()).toEqual({ busy: 0, queued: 0, size: 1 });
+    expect(p.stats()).toEqual({ busy: 0, queued: 0, size: 1, live: 1 });
   });
 
   it('rejects with PoolBusyError when the queue is full', async () => {
@@ -124,9 +124,39 @@ describe('tool pool (fixture worker)', () => {
     const a = p.run('block', { ms: 300 }, never());
     const b = p.run('fast', {}, never());
     await expect(p.run('fast', {}, never())).rejects.toBeInstanceOf(PoolBusyError);
-    expect(p.stats()).toEqual({ busy: 1, queued: 1, size: 1 });
+    expect(p.stats()).toEqual({ busy: 1, queued: 1, size: 1, live: 1 });
     expect(text(await a)).toMatch(/^block:/);
     expect(text(await b)).toMatch(/^fast:/);
+  });
+
+  it('caps live workers (active + retiring) at 2 × size', async () => {
+    const p = pool({ size: 1, deadlineMs: 100, maxQueue: 1 });
+    await warm(p, 1);
+    let maxLive = 0;
+    const sample = setInterval(() => { maxLive = Math.max(maxLive, p.stats().live); }, 5);
+    try {
+      const deadline = { isError: true, content: [{ type: 'text', text: 'Error: Tool call exceeded the 100 ms deadline' }] };
+      const t0 = Date.now();
+      // Miss 1: worker A retires (spinning until ~1500 ms); replacement B spawns → live 2.
+      expect(await p.run('block', { ms: 1500 }, never())).toEqual(deadline);
+      expect(p.stats()).toEqual({ busy: 0, queued: 0, size: 1, live: 2 });
+      // Miss 2: B retires; at the cap, so no replacement: the slot stays empty.
+      expect(await p.run('block', { ms: 1500 }, never())).toEqual(deadline);
+      expect(p.stats()).toEqual({ busy: 0, queued: 0, size: 1, live: 2 });
+      // A new call queues rather than spawning a third worker; one more is PoolBusyError.
+      const queued = p.run('fast', {}, never());
+      expect(p.stats()).toEqual({ busy: 0, queued: 1, size: 1, live: 2 });
+      await expect(p.run('fast', {}, never())).rejects.toBeInstanceOf(PoolBusyError);
+      // It runs once A exits (its 1500 ms block ends) and frees capacity.
+      expect(text(await queued)).toMatch(/^fast:/);
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(1400);
+      // Miss 3, on the refilled slot; the cap still holds.
+      expect(await p.run('block', { ms: 1500 }, never())).toEqual(deadline);
+      expect(text(await p.run('fast', {}, never()))).toMatch(/^fast:/);
+    } finally {
+      clearInterval(sample);
+    }
+    expect(maxLive).toBe(2);
   });
 
   it('reports a crashed worker and respawns it', async () => {
@@ -150,7 +180,7 @@ describe('tool pool (fixture worker)', () => {
     expect(await running).toEqual(shutdown);
     expect(await queued).toEqual(shutdown);
     expect(await p.run('fast', {}, never())).toEqual(shutdown);
-    expect(p.stats()).toEqual({ busy: 0, queued: 0, size: 1 });
+    expect(p.stats()).toEqual({ busy: 0, queued: 0, size: 1, live: 0 });
     await p.close(); // idempotent
   });
 });

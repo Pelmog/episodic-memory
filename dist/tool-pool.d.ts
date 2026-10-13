@@ -20,6 +20,11 @@ export type PoolOptions = {
  * Never `worker.terminate()`: terminating a worker while onnxruntime-node has
  * async native work in flight (model load or an embedding) aborts the whole
  * process with SIGABRT, whereas the worker's own process.exit() is clean.
+ *
+ * A retiring worker can stay busy for seconds (a sync SQLite query runs to
+ * completion), so live workers (active + retiring) are capped at 2 × size.
+ * At the cap a deadline/cancel still answers at once, but the slot stays empty
+ * (calls queue, PoolBusyError past maxQueue) until a retiring worker exits.
  */
 export declare function createToolPool(options: PoolOptions): {
     run: ToolExecutor;
@@ -28,5 +33,6 @@ export declare function createToolPool(options: PoolOptions): {
         busy: number;
         queued: number;
         size: number;
+        live: number;
     };
 };

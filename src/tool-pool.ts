@@ -21,7 +21,12 @@ type Call = {
   onAbort: () => void;
   timer?: ReturnType<typeof setTimeout>;
 };
-type Slot = { worker: Worker | null; busy: Call | null };
+/**
+ * `worker === null` has two meanings: after an idle crash the slot respawns
+ * lazily on its next call (if the cap allows); with `awaitingCapacity` it was
+ * retired at the cap and refills as soon as a retiring worker exits.
+ */
+type Slot = { worker: Worker | null; busy: Call | null; awaitingCapacity: boolean };
 type WorkerReply = { id: number; result: ToolResult };
 
 const errorResult = (text: string): ToolResult => ({ isError: true, content: [{ type: 'text', text }] });
@@ -41,22 +46,45 @@ const EXIT_MESSAGE = { type: 'exit' } as const;
  * Never `worker.terminate()`: terminating a worker while onnxruntime-node has
  * async native work in flight (model load or an embedding) aborts the whole
  * process with SIGABRT, whereas the worker's own process.exit() is clean.
+ *
+ * A retiring worker can stay busy for seconds (a sync SQLite query runs to
+ * completion), so live workers (active + retiring) are capped at 2 × size.
+ * At the cap a deadline/cancel still answers at once, but the slot stays empty
+ * (calls queue, PoolBusyError past maxQueue) until a retiring worker exits.
  */
 export function createToolPool(options: PoolOptions): {
   run: ToolExecutor;
   close(): Promise<void>;
-  stats(): { busy: number; queued: number; size: number };
+  stats(): { busy: number; queued: number; size: number; live: number };
 } {
   const { workerPath, size, deadlineMs, maxQueue } = options;
-  const slots: Slot[] = Array.from({ length: size }, () => ({ worker: null, busy: null }));
+  const slots: Slot[] = Array.from({ length: size }, () => ({ worker: null, busy: null, awaitingCapacity: false }));
   const queue: Call[] = [];
-  const exited = new Map<Worker, Promise<void>>(); // every live worker, current or retiring
+  // Every live worker (a slot's current worker or a retiring one) → resolves on its 'exit'.
+  // So live count = live.size = (slots with a worker) + (retiring workers not yet exited).
+  const live = new Map<Worker, Promise<void>>();
+  const maxLive = 2 * size;
   let nextId = 1;
   let closed = false;
 
+  const canSpawn = () => !closed && live.size < maxLive;
+  /** A slot can take a call now: it has a worker, or may spawn one under the cap. */
+  const usable = (s: Slot) => s.busy === null && (s.worker !== null || canSpawn());
+
+  function onWorkerExit(worker: Worker): void {
+    live.delete(worker);
+    // Capacity freed: refill slots that were retired at the cap, then serve the queue.
+    for (const slot of slots) {
+      if (slot.awaitingCapacity && slot.worker === null && canSpawn()) spawn(slot);
+    }
+    dispatch();
+  }
+
   function spawn(slot: Slot): Worker {
     const worker = new Worker(workerPath);
-    exited.set(worker, new Promise((resolve) => worker.once('exit', () => { exited.delete(worker); resolve(); })));
+    let exited!: () => void;
+    live.set(worker, new Promise<void>((resolve) => { exited = resolve; }));
+    slot.awaitingCapacity = false;
     worker.on('message', (reply: WorkerReply) => {
       // Replies from a retired worker, or for a call that already settled, are stale.
       if (slot.worker === worker && slot.busy !== null && slot.busy.id === reply?.id) finish(slot, reply.result);
@@ -69,20 +97,31 @@ export function createToolPool(options: PoolOptions): {
       // Respawn now if a call was lost; an idle crash respawns lazily on the next dispatch,
       // so a worker that dies at startup cannot spin in a respawn loop.
       if (slot.busy) {
-        spawn(slot);
+        replace(slot);
         finish(slot, errorResult(CRASHED));
       }
     };
     worker.on('error', lost);
-    worker.on('exit', () => lost());
+    worker.on('exit', () => {
+      lost(); // first, so dispatch below never picks this slot's dead worker
+      onWorkerExit(worker);
+      exited();
+    });
     slot.worker = worker;
     return worker;
   }
 
+  /** Give an emptied slot a new worker now, or once a retiring worker exits if at the cap. */
+  function replace(slot: Slot): void {
+    if (closed) return;
+    if (canSpawn()) spawn(slot);
+    else slot.awaitingCapacity = true;
+  }
+
   function retire(slot: Slot): void {
-    slot.worker?.postMessage(EXIT_MESSAGE);
+    slot.worker?.postMessage(EXIT_MESSAGE); // stays in `live` until it exits
     slot.worker = null;
-    if (!closed) spawn(slot);
+    replace(slot);
   }
 
   function detach(call: Call): void {
@@ -117,7 +156,7 @@ export function createToolPool(options: PoolOptions): {
 
   function dispatch(): void {
     while (!closed && queue.length > 0) {
-      const slot = slots.find((s) => s.busy === null);
+      const slot = slots.find(usable);
       if (!slot) return;
       start(slot, queue.shift()!);
     }
@@ -126,7 +165,7 @@ export function createToolPool(options: PoolOptions): {
   const run: ToolExecutor = async (name, args, signal) => {
     if (closed) return errorResult(SHUTTING_DOWN);
     if (signal.aborted) return errorResult(CANCELLED);
-    const idle = slots.find((s) => s.busy === null);
+    const idle = slots.find(usable);
     if (!idle && queue.length >= maxQueue) throw new PoolBusyError();
 
     return new Promise<ToolResult>((resolve) => {
@@ -163,14 +202,15 @@ export function createToolPool(options: PoolOptions): {
       for (const slot of slots) {
         slot.busy = null;
         slot.worker = null;
+        slot.awaitingCapacity = false;
       }
       for (const call of pending) {
         detach(call);
         call.resolve(errorResult(SHUTTING_DOWN));
       }
-      for (const worker of exited.keys()) worker.postMessage(EXIT_MESSAGE);
+      for (const worker of live.keys()) worker.postMessage(EXIT_MESSAGE);
     }
-    await Promise.all(exited.values());
+    await Promise.all(live.values());
   }
 
   for (const slot of slots) spawn(slot);
@@ -178,6 +218,6 @@ export function createToolPool(options: PoolOptions): {
   return {
     run,
     close,
-    stats: () => ({ busy: slots.filter((s) => s.busy !== null).length, queued: queue.length, size }),
+    stats: () => ({ busy: slots.filter((s) => s.busy !== null).length, queued: queue.length, size, live: live.size }),
   };
 }
