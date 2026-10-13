@@ -36,6 +36,10 @@ export declare class EmbeddingsUnavailableError extends Error {
         cause?: unknown;
     });
 }
+/**
+ * Singleflight: concurrent callers share one in-flight load; a failed load
+ * clears so a later call retries.
+ */
 export declare function initEmbeddings(): Promise<void>;
 export declare function generateEmbedding(text: string): Promise<number[]>;
 /**

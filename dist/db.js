@@ -4,26 +4,28 @@ import fs from 'fs';
 import * as sqliteVec from 'sqlite-vec';
 import { getDbPath } from './paths.js';
 import { EMBEDDING_VERSION } from './embedding-migration.js';
+/** Columns added to `exchanges` after the original schema; shared by migrateSchema and the read-only schema check. */
+const EXCHANGES_COLUMN_MIGRATIONS = [
+    { name: 'last_indexed', sql: 'ALTER TABLE exchanges ADD COLUMN last_indexed INTEGER' },
+    { name: 'parent_uuid', sql: 'ALTER TABLE exchanges ADD COLUMN parent_uuid TEXT' },
+    { name: 'is_sidechain', sql: 'ALTER TABLE exchanges ADD COLUMN is_sidechain BOOLEAN DEFAULT 0' },
+    { name: 'harness', sql: "ALTER TABLE exchanges ADD COLUMN harness TEXT NOT NULL DEFAULT 'claude'" },
+    { name: 'session_id', sql: 'ALTER TABLE exchanges ADD COLUMN session_id TEXT' },
+    { name: 'cwd', sql: 'ALTER TABLE exchanges ADD COLUMN cwd TEXT' },
+    { name: 'git_branch', sql: 'ALTER TABLE exchanges ADD COLUMN git_branch TEXT' },
+    { name: 'claude_version', sql: 'ALTER TABLE exchanges ADD COLUMN claude_version TEXT' },
+    { name: 'agent_version', sql: 'ALTER TABLE exchanges ADD COLUMN agent_version TEXT' },
+    { name: 'model', sql: 'ALTER TABLE exchanges ADD COLUMN model TEXT' },
+    { name: 'model_provider', sql: 'ALTER TABLE exchanges ADD COLUMN model_provider TEXT' },
+    { name: 'thinking_level', sql: 'ALTER TABLE exchanges ADD COLUMN thinking_level TEXT' },
+    { name: 'thinking_disabled', sql: 'ALTER TABLE exchanges ADD COLUMN thinking_disabled BOOLEAN' },
+    { name: 'thinking_triggers', sql: 'ALTER TABLE exchanges ADD COLUMN thinking_triggers TEXT' },
+    { name: 'embedding_version', sql: 'ALTER TABLE exchanges ADD COLUMN embedding_version INTEGER NOT NULL DEFAULT 0' },
+];
 export function migrateSchema(db) {
     const columns = db.prepare(`SELECT name FROM pragma_table_info('exchanges')`).all();
     const columnNames = new Set(columns.map(c => c.name));
-    const migrations = [
-        { name: 'last_indexed', sql: 'ALTER TABLE exchanges ADD COLUMN last_indexed INTEGER' },
-        { name: 'parent_uuid', sql: 'ALTER TABLE exchanges ADD COLUMN parent_uuid TEXT' },
-        { name: 'is_sidechain', sql: 'ALTER TABLE exchanges ADD COLUMN is_sidechain BOOLEAN DEFAULT 0' },
-        { name: 'harness', sql: "ALTER TABLE exchanges ADD COLUMN harness TEXT NOT NULL DEFAULT 'claude'" },
-        { name: 'session_id', sql: 'ALTER TABLE exchanges ADD COLUMN session_id TEXT' },
-        { name: 'cwd', sql: 'ALTER TABLE exchanges ADD COLUMN cwd TEXT' },
-        { name: 'git_branch', sql: 'ALTER TABLE exchanges ADD COLUMN git_branch TEXT' },
-        { name: 'claude_version', sql: 'ALTER TABLE exchanges ADD COLUMN claude_version TEXT' },
-        { name: 'agent_version', sql: 'ALTER TABLE exchanges ADD COLUMN agent_version TEXT' },
-        { name: 'model', sql: 'ALTER TABLE exchanges ADD COLUMN model TEXT' },
-        { name: 'model_provider', sql: 'ALTER TABLE exchanges ADD COLUMN model_provider TEXT' },
-        { name: 'thinking_level', sql: 'ALTER TABLE exchanges ADD COLUMN thinking_level TEXT' },
-        { name: 'thinking_disabled', sql: 'ALTER TABLE exchanges ADD COLUMN thinking_disabled BOOLEAN' },
-        { name: 'thinking_triggers', sql: 'ALTER TABLE exchanges ADD COLUMN thinking_triggers TEXT' },
-        { name: 'embedding_version', sql: 'ALTER TABLE exchanges ADD COLUMN embedding_version INTEGER NOT NULL DEFAULT 0' },
-    ];
+    const migrations = EXCHANGES_COLUMN_MIGRATIONS;
     let migrated = false;
     for (const migration of migrations) {
         if (!columnNames.has(migration.name)) {
@@ -184,6 +186,33 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_tool_exchange ON tool_calls(exchange_id)
   `);
     return db;
+}
+/**
+ * Open the index read-only for shared/long-lived readers. Never creates the
+ * file, never migrates; throws if the schema is older than this build.
+ */
+export function openReadOnlyDatabase() {
+    const db = new Database(getDbPath(), { readonly: true, fileMustExist: true });
+    try {
+        sqliteVec.load(db);
+        db.pragma('busy_timeout = 5000');
+        const have = new Set(db.prepare(`SELECT name FROM pragma_table_info('exchanges')`).all()
+            .map(c => c.name));
+        const tables = new Set(db.prepare(`SELECT name FROM sqlite_master WHERE name IN ('tool_calls', 'vec_exchanges')`).all()
+            .map(r => r.name));
+        const ok = have.size > 0 &&
+            EXCHANGES_COLUMN_MIGRATIONS.every(m => have.has(m.name)) &&
+            tables.has('tool_calls') &&
+            tables.has('vec_exchanges');
+        if (!ok) {
+            throw new Error('The conversation index schema is older than this build; run "episodic-memory sync" first.');
+        }
+        return db;
+    }
+    catch (error) {
+        db.close();
+        throw error;
+    }
 }
 export function insertExchange(db, exchange, embedding, toolNames) {
     const now = Date.now();

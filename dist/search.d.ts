@@ -1,3 +1,4 @@
+import Database from 'better-sqlite3';
 import { SearchResult, MultiConceptResult } from './types.js';
 export interface SearchOptions {
     limit?: number;
@@ -39,6 +40,8 @@ export declare function buildTextMatchClause(query: string): {
  * the L2 distance returned by sqlite-vec satisfies the unit-vector identity.
  */
 export declare function l2DistanceToCosineSimilarity(distance: number): number;
+/** Choose how searches open the index (default: initDatabase, which may migrate). */
+export declare function configureSearchDatabase(opener: () => Database.Database): void;
 export declare function searchConversations(query: string, options?: SearchOptions): Promise<SearchResult[]>;
 export declare function formatResults(results: Array<SearchResult & {
     summary?: string;

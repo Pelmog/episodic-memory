@@ -30344,26 +30344,27 @@ import * as lockfile from "proper-lockfile";
 var DEFAULT_STALE_MS = 10 * 60 * 1e3;
 
 // src/db.ts
+var EXCHANGES_COLUMN_MIGRATIONS = [
+  { name: "last_indexed", sql: "ALTER TABLE exchanges ADD COLUMN last_indexed INTEGER" },
+  { name: "parent_uuid", sql: "ALTER TABLE exchanges ADD COLUMN parent_uuid TEXT" },
+  { name: "is_sidechain", sql: "ALTER TABLE exchanges ADD COLUMN is_sidechain BOOLEAN DEFAULT 0" },
+  { name: "harness", sql: "ALTER TABLE exchanges ADD COLUMN harness TEXT NOT NULL DEFAULT 'claude'" },
+  { name: "session_id", sql: "ALTER TABLE exchanges ADD COLUMN session_id TEXT" },
+  { name: "cwd", sql: "ALTER TABLE exchanges ADD COLUMN cwd TEXT" },
+  { name: "git_branch", sql: "ALTER TABLE exchanges ADD COLUMN git_branch TEXT" },
+  { name: "claude_version", sql: "ALTER TABLE exchanges ADD COLUMN claude_version TEXT" },
+  { name: "agent_version", sql: "ALTER TABLE exchanges ADD COLUMN agent_version TEXT" },
+  { name: "model", sql: "ALTER TABLE exchanges ADD COLUMN model TEXT" },
+  { name: "model_provider", sql: "ALTER TABLE exchanges ADD COLUMN model_provider TEXT" },
+  { name: "thinking_level", sql: "ALTER TABLE exchanges ADD COLUMN thinking_level TEXT" },
+  { name: "thinking_disabled", sql: "ALTER TABLE exchanges ADD COLUMN thinking_disabled BOOLEAN" },
+  { name: "thinking_triggers", sql: "ALTER TABLE exchanges ADD COLUMN thinking_triggers TEXT" },
+  { name: "embedding_version", sql: "ALTER TABLE exchanges ADD COLUMN embedding_version INTEGER NOT NULL DEFAULT 0" }
+];
 function migrateSchema(db) {
   const columns = db.prepare(`SELECT name FROM pragma_table_info('exchanges')`).all();
   const columnNames = new Set(columns.map((c) => c.name));
-  const migrations = [
-    { name: "last_indexed", sql: "ALTER TABLE exchanges ADD COLUMN last_indexed INTEGER" },
-    { name: "parent_uuid", sql: "ALTER TABLE exchanges ADD COLUMN parent_uuid TEXT" },
-    { name: "is_sidechain", sql: "ALTER TABLE exchanges ADD COLUMN is_sidechain BOOLEAN DEFAULT 0" },
-    { name: "harness", sql: "ALTER TABLE exchanges ADD COLUMN harness TEXT NOT NULL DEFAULT 'claude'" },
-    { name: "session_id", sql: "ALTER TABLE exchanges ADD COLUMN session_id TEXT" },
-    { name: "cwd", sql: "ALTER TABLE exchanges ADD COLUMN cwd TEXT" },
-    { name: "git_branch", sql: "ALTER TABLE exchanges ADD COLUMN git_branch TEXT" },
-    { name: "claude_version", sql: "ALTER TABLE exchanges ADD COLUMN claude_version TEXT" },
-    { name: "agent_version", sql: "ALTER TABLE exchanges ADD COLUMN agent_version TEXT" },
-    { name: "model", sql: "ALTER TABLE exchanges ADD COLUMN model TEXT" },
-    { name: "model_provider", sql: "ALTER TABLE exchanges ADD COLUMN model_provider TEXT" },
-    { name: "thinking_level", sql: "ALTER TABLE exchanges ADD COLUMN thinking_level TEXT" },
-    { name: "thinking_disabled", sql: "ALTER TABLE exchanges ADD COLUMN thinking_disabled BOOLEAN" },
-    { name: "thinking_triggers", sql: "ALTER TABLE exchanges ADD COLUMN thinking_triggers TEXT" },
-    { name: "embedding_version", sql: "ALTER TABLE exchanges ADD COLUMN embedding_version INTEGER NOT NULL DEFAULT 0" }
-  ];
+  const migrations = EXCHANGES_COLUMN_MIGRATIONS;
   let migrated = false;
   for (const migration of migrations) {
     if (!columnNames.has(migration.name)) {
@@ -30525,7 +30526,15 @@ var EmbeddingsUnavailableError = class extends Error {
     this.name = "EmbeddingsUnavailableError";
   }
 };
+var initPromise = null;
 async function initEmbeddings() {
+  if (embeddingPipeline) return;
+  initPromise ??= loadPipeline().finally(() => {
+    if (!embeddingPipeline) initPromise = null;
+  });
+  return initPromise;
+}
+async function loadPipeline() {
   if (embeddingPipeline) return;
   let pipeline;
   try {
@@ -30695,67 +30704,71 @@ function validateISODate(dateStr, paramName) {
     throw new Error(`Invalid ${paramName} date: "${dateStr}". Not a valid calendar date.`);
   }
 }
+var openSearchDatabase = initDatabase;
 async function searchConversations(query, options = {}) {
   const { limit = 10, mode = "both", after, before } = options;
   const includeSidechains = options.include_sidechains !== false;
   const sidechainClause = includeSidechains ? "" : "AND e.is_sidechain = 0";
   if (after) validateISODate(after, "--after");
   if (before) validateISODate(before, "--before");
-  const db = initDatabase();
+  const db = openSearchDatabase();
   let results = [];
-  const { sql: filterClause, params: filterParams } = buildSearchFilters(options);
-  if (mode === "vector" || mode === "both") {
-    await initEmbeddings();
-    const queryEmbedding = await generateQueryEmbedding(query);
-    const k2 = limit * 3;
-    const stmt = db.prepare(`
-      SELECT
-        ${EXCHANGE_SELECT_COLUMNS},
-        vec.distance
-      FROM vec_exchanges AS vec
-      JOIN exchanges AS e ON vec.id = e.id
-      WHERE vec.embedding MATCH ?
-        AND k = ?
-        ${sidechainClause}
-        ${filterClause}
-      ORDER BY (vec.distance + e.is_sidechain * ?) ASC
-    `);
-    results = stmt.all(
-      Buffer.from(new Float32Array(queryEmbedding).buffer),
-      k2,
-      ...filterParams,
-      SIDECHAIN_DISTANCE_PENALTY
-    );
-    if (results.length > limit) {
-      results = results.slice(0, limit);
-    }
-  }
-  if (mode === "text" || mode === "both") {
-    const { sql: textMatchSql, params: textMatchParams } = buildTextMatchClause(query);
-    const textStmt = db.prepare(`
-      SELECT
-        ${EXCHANGE_SELECT_COLUMNS},
-        0 as distance
-      FROM exchanges AS e
-      WHERE ${textMatchSql}
-        ${sidechainClause}
-        ${filterClause}
-      ORDER BY e.is_sidechain ASC, e.timestamp DESC
-      LIMIT ?
-    `);
-    const textResults = textStmt.all(...textMatchParams, ...filterParams, limit);
-    if (mode === "both") {
-      const seenIds = new Set(results.map((r) => r.id));
-      for (const textResult of textResults) {
-        if (!seenIds.has(textResult.id)) {
-          results.push(textResult);
-        }
+  try {
+    const { sql: filterClause, params: filterParams } = buildSearchFilters(options);
+    if (mode === "vector" || mode === "both") {
+      await initEmbeddings();
+      const queryEmbedding = await generateQueryEmbedding(query);
+      const k2 = limit * 3;
+      const stmt = db.prepare(`
+        SELECT
+          ${EXCHANGE_SELECT_COLUMNS},
+          vec.distance
+        FROM vec_exchanges AS vec
+        JOIN exchanges AS e ON vec.id = e.id
+        WHERE vec.embedding MATCH ?
+          AND k = ?
+          ${sidechainClause}
+          ${filterClause}
+        ORDER BY (vec.distance + e.is_sidechain * ?) ASC
+      `);
+      results = stmt.all(
+        Buffer.from(new Float32Array(queryEmbedding).buffer),
+        k2,
+        ...filterParams,
+        SIDECHAIN_DISTANCE_PENALTY
+      );
+      if (results.length > limit) {
+        results = results.slice(0, limit);
       }
-    } else {
-      results = textResults;
     }
+    if (mode === "text" || mode === "both") {
+      const { sql: textMatchSql, params: textMatchParams } = buildTextMatchClause(query);
+      const textStmt = db.prepare(`
+        SELECT
+          ${EXCHANGE_SELECT_COLUMNS},
+          0 as distance
+        FROM exchanges AS e
+        WHERE ${textMatchSql}
+          ${sidechainClause}
+          ${filterClause}
+        ORDER BY e.is_sidechain ASC, e.timestamp DESC
+        LIMIT ?
+      `);
+      const textResults = textStmt.all(...textMatchParams, ...filterParams, limit);
+      if (mode === "both") {
+        const seenIds = new Set(results.map((r) => r.id));
+        for (const textResult of textResults) {
+          if (!seenIds.has(textResult.id)) {
+            results.push(textResult);
+          }
+        }
+      } else {
+        results = textResults;
+      }
+    }
+  } finally {
+    db.close();
   }
-  db.close();
   return results.map((row) => {
     const exchange = exchangeFromRow(row);
     const summaryPath = row.archive_path.replace(".jsonl", "-summary.txt");

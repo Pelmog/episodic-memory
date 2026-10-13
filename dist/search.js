@@ -151,6 +151,11 @@ function validateISODate(dateStr, paramName) {
         throw new Error(`Invalid ${paramName} date: "${dateStr}". Not a valid calendar date.`);
     }
 }
+let openSearchDatabase = initDatabase;
+/** Choose how searches open the index (default: initDatabase, which may migrate). */
+export function configureSearchDatabase(opener) {
+    openSearchDatabase = opener;
+}
 export async function searchConversations(query, options = {}) {
     const { limit = 10, mode = 'both', after, before } = options;
     const includeSidechains = options.include_sidechains !== false;
@@ -160,66 +165,70 @@ export async function searchConversations(query, options = {}) {
         validateISODate(after, '--after');
     if (before)
         validateISODate(before, '--before');
-    const db = initDatabase();
+    const db = openSearchDatabase();
     let results = [];
-    const { sql: filterClause, params: filterParams } = buildSearchFilters(options);
-    if (mode === 'vector' || mode === 'both') {
-        // Vector similarity search.
-        // vec0 applies KNN before the WHERE clause and before our sidechain
-        // de-rank, so we over-fetch candidates and trim after the final ordering.
-        await initEmbeddings();
-        const queryEmbedding = await generateQueryEmbedding(query);
-        const k = limit * 3;
-        const stmt = db.prepare(`
-      SELECT
-        ${EXCHANGE_SELECT_COLUMNS},
-        vec.distance
-      FROM vec_exchanges AS vec
-      JOIN exchanges AS e ON vec.id = e.id
-      WHERE vec.embedding MATCH ?
-        AND k = ?
-        ${sidechainClause}
-        ${filterClause}
-      ORDER BY (vec.distance + e.is_sidechain * ?) ASC
-    `);
-        results = stmt.all(Buffer.from(new Float32Array(queryEmbedding).buffer), k, ...filterParams, SIDECHAIN_DISTANCE_PENALTY);
-        if (results.length > limit) {
-            results = results.slice(0, limit);
-        }
-    }
-    if (mode === 'text' || mode === 'both') {
-        // Text search: AND of per-token LIKE patterns so multi-word queries match
-        // when every term appears somewhere in the exchange (any order, either field).
-        // See #127 — whole-query contiguous substring matching returned empty for
-        // typical multi-word searches that are not verbatim phrases. Sidechain rows
-        // are de-ranked (ordered after main-thread rows), not excluded (#128).
-        const { sql: textMatchSql, params: textMatchParams } = buildTextMatchClause(query);
-        const textStmt = db.prepare(`
-      SELECT
-        ${EXCHANGE_SELECT_COLUMNS},
-        0 as distance
-      FROM exchanges AS e
-      WHERE ${textMatchSql}
-        ${sidechainClause}
-        ${filterClause}
-      ORDER BY e.is_sidechain ASC, e.timestamp DESC
-      LIMIT ?
-    `);
-        const textResults = textStmt.all(...textMatchParams, ...filterParams, limit);
-        if (mode === 'both') {
-            // Merge and deduplicate by ID
-            const seenIds = new Set(results.map(r => r.id));
-            for (const textResult of textResults) {
-                if (!seenIds.has(textResult.id)) {
-                    results.push(textResult);
-                }
+    try {
+        const { sql: filterClause, params: filterParams } = buildSearchFilters(options);
+        if (mode === 'vector' || mode === 'both') {
+            // Vector similarity search.
+            // vec0 applies KNN before the WHERE clause and before our sidechain
+            // de-rank, so we over-fetch candidates and trim after the final ordering.
+            await initEmbeddings();
+            const queryEmbedding = await generateQueryEmbedding(query);
+            const k = limit * 3;
+            const stmt = db.prepare(`
+        SELECT
+          ${EXCHANGE_SELECT_COLUMNS},
+          vec.distance
+        FROM vec_exchanges AS vec
+        JOIN exchanges AS e ON vec.id = e.id
+        WHERE vec.embedding MATCH ?
+          AND k = ?
+          ${sidechainClause}
+          ${filterClause}
+        ORDER BY (vec.distance + e.is_sidechain * ?) ASC
+      `);
+            results = stmt.all(Buffer.from(new Float32Array(queryEmbedding).buffer), k, ...filterParams, SIDECHAIN_DISTANCE_PENALTY);
+            if (results.length > limit) {
+                results = results.slice(0, limit);
             }
         }
-        else {
-            results = textResults;
+        if (mode === 'text' || mode === 'both') {
+            // Text search: AND of per-token LIKE patterns so multi-word queries match
+            // when every term appears somewhere in the exchange (any order, either field).
+            // See #127 — whole-query contiguous substring matching returned empty for
+            // typical multi-word searches that are not verbatim phrases. Sidechain rows
+            // are de-ranked (ordered after main-thread rows), not excluded (#128).
+            const { sql: textMatchSql, params: textMatchParams } = buildTextMatchClause(query);
+            const textStmt = db.prepare(`
+        SELECT
+          ${EXCHANGE_SELECT_COLUMNS},
+          0 as distance
+        FROM exchanges AS e
+        WHERE ${textMatchSql}
+          ${sidechainClause}
+          ${filterClause}
+        ORDER BY e.is_sidechain ASC, e.timestamp DESC
+        LIMIT ?
+      `);
+            const textResults = textStmt.all(...textMatchParams, ...filterParams, limit);
+            if (mode === 'both') {
+                // Merge and deduplicate by ID
+                const seenIds = new Set(results.map(r => r.id));
+                for (const textResult of textResults) {
+                    if (!seenIds.has(textResult.id)) {
+                        results.push(textResult);
+                    }
+                }
+            }
+            else {
+                results = textResults;
+            }
         }
     }
-    db.close();
+    finally {
+        db.close();
+    }
     return results.map((row) => {
         const exchange = exchangeFromRow(row);
         // Try to load summary if available. Skip error sentinels (#96) so failed

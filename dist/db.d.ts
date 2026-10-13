@@ -14,6 +14,11 @@ export declare function migrateSchema(db: Database.Database): void;
  */
 export declare function migrateToolCallsCascade(db: Database.Database): void;
 export declare function initDatabase(): Database.Database;
+/**
+ * Open the index read-only for shared/long-lived readers. Never creates the
+ * file, never migrates; throws if the schema is older than this build.
+ */
+export declare function openReadOnlyDatabase(): Database.Database;
 export declare function insertExchange(db: Database.Database, exchange: ConversationExchange, embedding: number[], toolNames?: string[]): void;
 export declare function getAllExchanges(db: Database.Database): Array<{
     id: string;

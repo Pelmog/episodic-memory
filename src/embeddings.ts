@@ -68,7 +68,19 @@ export class EmbeddingsUnavailableError extends Error {
   }
 }
 
+let initPromise: Promise<void> | null = null;
+
+/**
+ * Singleflight: concurrent callers share one in-flight load; a failed load
+ * clears so a later call retries.
+ */
 export async function initEmbeddings(): Promise<void> {
+  if (embeddingPipeline) return;
+  initPromise ??= loadPipeline().finally(() => { if (!embeddingPipeline) initPromise = null; });
+  return initPromise;
+}
+
+async function loadPipeline(): Promise<void> {
   if (embeddingPipeline) return;
 
   // Load @huggingface/transformers lazily. Its module graph eagerly requires
