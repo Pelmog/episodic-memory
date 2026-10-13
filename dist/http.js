@@ -54,9 +54,23 @@ export function createEpisodicHttpServer(token, execute) {
         request.signal?.addEventListener('abort', teardown, { once: true });
         try {
             await server.connect(transport);
-            return await transport.handleRequest(request, {
+            const handled = transport.handleRequest(request, {
                 ...(options?.parsedBody !== undefined && { parsedBody: options.parsedBody }),
             });
+            handled.catch(() => { }); // a late rejection after an abort must not go unhandled
+            // On client disconnect the JSON-mode exchange never settles; race it so
+            // the admission slot is always released.
+            const aborted = new Promise((resolve) => {
+                if (request.signal.aborted)
+                    resolve(new Response(null, { status: 499 }));
+                else
+                    request.signal.addEventListener('abort', () => resolve(new Response(null, { status: 499 })), { once: true });
+            });
+            return await Promise.race([handled, aborted]);
+        }
+        catch {
+            process.stderr.write('episodic-memory legacy request failed\n');
+            return new Response(null, { status: 500 });
         }
         finally {
             teardown();

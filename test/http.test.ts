@@ -150,6 +150,43 @@ describe('late PoolBusyError', () => {
   });
 });
 
+describe('legacy disconnects', () => {
+  it('releases admission slots when legacy clients disconnect mid tool call', async () => {
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on('unhandledRejection', onRejection);
+    cleanups.push(async () => void process.off('unhandledRejection', onRejection));
+    let entered = 0;
+    let slow = true;
+    const url = await serve(async () => {
+      entered++;
+      if (slow) await new Promise((resolve) => setTimeout(resolve, 300));
+      return { content: [{ type: 'text', text: 'ok' }] };
+    });
+    const body = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'search', arguments: { query: 'abc' } },
+    });
+    const N = MAX_ADMITTED + 2;
+    for (let i = 0; i < N; i++) {
+      const req = request(url, { method: 'POST', headers });
+      req.on('error', () => {});
+      req.end(body);
+      const deadline = Date.now() + 2000;
+      while (entered <= i && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+      expect(entered).toBe(i + 1);
+      req.destroy();
+    }
+    await new Promise((r) => setTimeout(r, 400));
+    slow = false;
+    const legacy = await legacyClient(url);
+    expect(text(await legacy.callTool({ name: 'search', arguments: { query: 'abc' } }))).toBe('ok');
+    expect(rejections).toEqual([]);
+  });
+});
+
 describe('request gatekeeping', () => {
   it('rejects bad auth, host, origin, method, path, body', async () => {
     const url = await serve(echo);

@@ -39912,9 +39912,19 @@ function createEpisodicHttpServer(token, execute) {
     request.signal?.addEventListener("abort", teardown, { once: true });
     try {
       await server.connect(transport);
-      return await transport.handleRequest(request, {
+      const handled = transport.handleRequest(request, {
         ...options?.parsedBody !== void 0 && { parsedBody: options.parsedBody }
       });
+      handled.catch(() => {
+      });
+      const aborted2 = new Promise((resolve) => {
+        if (request.signal.aborted) resolve(new Response(null, { status: 499 }));
+        else request.signal.addEventListener("abort", () => resolve(new Response(null, { status: 499 })), { once: true });
+      });
+      return await Promise.race([handled, aborted2]);
+    } catch {
+      process.stderr.write("episodic-memory legacy request failed\n");
+      return new Response(null, { status: 500 });
     } finally {
       teardown();
     }
