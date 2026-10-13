@@ -1,7 +1,13 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { timingSafeEqual } from 'node:crypto';
 import { createServer, type Server as HttpServer } from 'node:http';
-import { createMcpHandler, type McpHttpHandler } from '@modelcontextprotocol/server';
+import {
+  createMcpHandler,
+  isLegacyRequest,
+  WebStandardStreamableHTTPServerTransport,
+  type McpHandlerRequestOptions,
+  type McpHttpHandler,
+} from '@modelcontextprotocol/server';
 import { localhostHostValidation, localhostOriginValidation, toNodeHandler } from '@modelcontextprotocol/node';
 import { createEpisodicServer, type ToolExecutor } from './mcp-factory.js';
 import { PoolBusyError } from './tool-pool.js';
@@ -41,15 +47,45 @@ export function createEpisodicHttpServer(
     }
   };
 
+  // Legacy (2025-era) clients are served by our own stateless leg with
+  // enableJsonResponse, so the HTTP response is produced only after the tool
+  // settles. (The SDK's built-in stateless fallback answers with an SSE stream
+  // before the handler runs, which would make a late PoolBusyError unmappable.)
+  const legacyFetch = async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> => {
+    if (request.method.toUpperCase() !== 'POST') return new Response(null, { status: 405, headers: { Allow: 'POST' } });
+    const server = createEpisodicServer({ execute: guarded });
+    const transport = new WebStandardStreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+      maxRequestBodySize: MAX_BODY_BYTES,
+    });
+    const teardown = () => {
+      transport.close().catch(() => {});
+      server.close().catch(() => {});
+    };
+    request.signal?.addEventListener('abort', teardown, { once: true });
+    try {
+      await server.connect(transport);
+      return await transport.handleRequest(request, {
+        ...(options?.parsedBody !== undefined && { parsedBody: options.parsedBody }),
+      });
+    } finally {
+      teardown();
+    }
+  };
+
   const mcp: McpHttpHandler = createMcpHandler(() => createEpisodicServer({ execute: guarded }), {
-    legacy: 'stateless',
+    legacy: 'reject',
     maxSubscriptions: 0,
     onerror: () => process.stderr.write('episodic-memory rejected a protocol request\n'),
   });
   const handle = toNodeHandler({
     fetch: async (request, options) => {
       const store: RequestState = { busy: false };
-      const response = await state.run(store, () => mcp.fetch(request, options));
+      const response = await state.run(store, async () =>
+        (await isLegacyRequest(request.clone(), options?.parsedBody))
+          ? legacyFetch(request, options)
+          : mcp.fetch(request, options));
       return store.busy
         ? new Response(null, { status: 503, headers: { 'Retry-After': '1' } })
         : response;

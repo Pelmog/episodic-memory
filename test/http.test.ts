@@ -137,12 +137,28 @@ describe('catalog and tool calls', () => {
   });
 });
 
+describe('late PoolBusyError', () => {
+  it('maps PoolBusyError raised after a macrotask to 503 for modern and legacy clients', async () => {
+    const url = await serve(async () => {
+      await new Promise((resolve) => setTimeout(resolve));
+      throw new PoolBusyError();
+    });
+    const modern = await modernClient(url);
+    expect(await statusOf(modern.callTool({ name: 'search', arguments: { query: 'abc' } }))).toBe(503);
+    const legacy = await legacyClient(url);
+    expect(await statusOf(legacy.callTool({ name: 'search', arguments: { query: 'abc' } }))).toBe(503);
+  });
+});
+
 describe('request gatekeeping', () => {
   it('rejects bad auth, host, origin, method, path, body', async () => {
     const url = await serve(echo);
     expect((await fetch(url, { method: 'POST', body: '{}' })).status).toBe(401);
     expect(
       (await fetch(url, { method: 'POST', headers: { ...headers, Authorization: 'Bearer wrong' }, body: '{}' })).status,
+    ).toBe(401);
+    expect(
+      (await fetch(url, { method: 'POST', headers: { ...headers, Authorization: `Bearer ${'x'.repeat(token.length)}` }, body: '{}' })).status,
     ).toBe(401);
     const origin = await fetch(url, {
       method: 'POST',

@@ -35499,6 +35499,11 @@ async function classifyEntryRequest(request, providedParsedBody, needsForward = 
     forwardRequest
   };
 }
+async function isLegacyRequest(request, parsedBody, options) {
+  const maxRequestBodySize = resolveMaxRequestBodySize(options?.maxRequestBodySize);
+  const classified = await classifyEntryRequest(parsedBody === void 0 && request.method.toUpperCase() === "POST" ? request.clone() : request, parsedBody, false, maxRequestBodySize);
+  return classified.step === "no-json-body" || classified.step === "classified" && classified.outcome.kind === "legacy";
+}
 function createMcpHandler(factory, options = {}) {
   const { legacy, onerror, responseMode } = options;
   const maxRequestBodySize = resolveMaxRequestBodySize(options.maxRequestBodySize);
@@ -39890,15 +39895,39 @@ function createEpisodicHttpServer(token, execute) {
       return { content: [{ type: "text", text: `Error: ${message}` }], isError: true };
     }
   };
+  const legacyFetch = async (request, options) => {
+    if (request.method.toUpperCase() !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
+    const server = createEpisodicServer({ execute: guarded });
+    const transport = new WebStandardStreamableHTTPServerTransport({
+      sessionIdGenerator: void 0,
+      enableJsonResponse: true,
+      maxRequestBodySize: MAX_BODY_BYTES
+    });
+    const teardown = () => {
+      transport.close().catch(() => {
+      });
+      server.close().catch(() => {
+      });
+    };
+    request.signal?.addEventListener("abort", teardown, { once: true });
+    try {
+      await server.connect(transport);
+      return await transport.handleRequest(request, {
+        ...options?.parsedBody !== void 0 && { parsedBody: options.parsedBody }
+      });
+    } finally {
+      teardown();
+    }
+  };
   const mcp = createMcpHandler(() => createEpisodicServer({ execute: guarded }), {
-    legacy: "stateless",
+    legacy: "reject",
     maxSubscriptions: 0,
     onerror: () => process.stderr.write("episodic-memory rejected a protocol request\n")
   });
   const handle = toNodeHandler({
     fetch: async (request, options) => {
       const store = { busy: false };
-      const response = await state.run(store, () => mcp.fetch(request, options));
+      const response = await state.run(store, async () => await isLegacyRequest(request.clone(), options?.parsedBody) ? legacyFetch(request, options) : mcp.fetch(request, options));
       return store.busy ? new Response(null, { status: 503, headers: { "Retry-After": "1" } }) : response;
     }
   });
