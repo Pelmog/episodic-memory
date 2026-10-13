@@ -120,7 +120,7 @@ class CodexPureTests(Base):
         data = jread(mls.INSTALLED_PLUGINS)
         data["plugins"]["episodic-memory@superpowers-marketplace"].append({"scope": "user", "installPath": "/y"})
         write(mls.INSTALLED_PLUGINS, json.dumps(data))
-        with self.assertRaises(Exception):
+        with self.assertRaises(mls.PreflightError):
             mls.registered_plugin_dir()
 
 
@@ -159,7 +159,7 @@ class ManifestSwitchTests(Base):
     def test_failure_on_second_write_restores_first(self):
         before = self.all_bytes()
         with mock.patch.object(mls.os, "replace", check_replace_failing(2)):
-            with self.assertRaises(Exception):
+            with self.assertRaises(RuntimeError):
                 mls.Switcher("plugin-manifest").apply()
         self.assertEqual(self.all_bytes(), before)
         rec = jread(mls.RECORD)
@@ -169,14 +169,39 @@ class ManifestSwitchTests(Base):
     def test_preflight_rejects_unparseable_or_unexpected(self):
         (self.plugin / ".mcp.json").write_text("{not json")
         before = self.all_bytes()
-        with self.assertRaises(Exception):
+        with self.assertRaises(mls.PreflightError):
             mls.Switcher("plugin-manifest").apply()
         self.assertEqual(self.all_bytes(), before)
         self.assertFalse(mls.RECORD.exists())
         write(self.plugin / ".mcp.json", json.dumps({"mcpServers": {"episodic-memory": {"type": "http", "url": "http://elsewhere"}}}))
-        with self.assertRaises(Exception):
+        with self.assertRaises(mls.PreflightError):
             mls.Switcher("plugin-manifest").apply()
         self.assertFalse(mls.RECORD.exists())
+
+
+class CodexPreflightRefusalTests(Base):
+    def _refuses(self, new_text, needle):
+        mls.CODEX_CONFIG.write_text(new_text)
+        before = self.all_bytes()
+        with self.assertRaises(mls.PreflightError) as cm:
+            mls.Switcher("plugin-manifest").apply()
+        self.assertIn(needle, str(cm.exception))
+        self.assertEqual(self.all_bytes(), before)
+        self.assertFalse(mls.RECORD.exists())
+
+    def test_refuses_subtable(self):
+        self._refuses(CODEX.replace("# --- end", '[mcp_servers.episodic-memory.env]\nA = "1"\n\n# --- end'),
+                      "mcp_servers.episodic-memory.")
+
+    def test_refuses_enabled_false(self):
+        self._refuses(CODEX.replace("tool_timeout_sec", "enabled = false\ntool_timeout_sec"), "enabled")
+
+    def test_refuses_unknown_key(self):
+        self._refuses(CODEX.replace("tool_timeout_sec", "enabled_tools = [\"search\"]\ntool_timeout_sec"), "enabled_tools")
+
+    def test_allows_args_and_timeouts(self):
+        mls.CODEX_CONFIG.write_text(CODEX.replace("startup_timeout_sec", 'args = ["mcp"]\nstartup_timeout_sec'))
+        mls.Switcher("plugin-manifest").apply()
 
 
 class RollbackTests(Base):

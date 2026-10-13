@@ -242,6 +242,16 @@ class Switcher:
                 return None, current, True
             if not re.search(r"(?m)^command\s*=", current) or re.search(r"(?m)^url\s*=", current):
                 raise PreflightError(f"{t.path}: episodic-memory block is not the expected stdio form")
+            if re.search(r"(?m)^\[mcp_servers\.episodic-memory\.", t.path.read_text()):
+                raise PreflightError(f"{t.path}: [mcp_servers.episodic-memory.*] sub-tables are not supported "
+                                     "(Codex rejects them on an HTTP server); remove them and re-run")
+            allowed = {"command", "args", "startup_timeout_sec", "tool_timeout_sec"}
+            for ln in current.splitlines()[1:]:
+                m = re.match(r"\s*([A-Za-z0-9_.\"-]+)\s*=", ln)
+                if m and m.group(1) not in allowed:
+                    hint = " (the server is disabled; enable or remove it first)" if m.group(1) == "enabled" else ""
+                    raise PreflightError(f"{t.path}: unsupported key {m.group(1)!r} in the episodic-memory block{hint}; "
+                                         "refusing to drop it")
             return current, extract_block(codex_switch(t.path.read_text(), URL, token)), False
         if t.kind == "text":
             if OLD_TOOL_PREFIX in current:

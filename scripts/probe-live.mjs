@@ -24,16 +24,12 @@ async function exercise(label, client, transport) {
   }));
   if (search.isError) throw new Error(`${label}: search returned an error`);
   const results = JSON.parse(search.content[0].text).results ?? [];
-  let readMs = null;
-  let readOk = null;
-  if (results.length > 0) {
-    const [read, ms] = await timed(() => client.callTool({
-      name: 'read', arguments: { path: results[0].exchange.archivePath, startLine: 1, endLine: 5 },
-    }));
-    if (read.isError) throw new Error(`${label}: read returned an error`);
-    readMs = ms;
-    readOk = true;
-  }
+  if (results.length === 0) throw new Error('read not exercised: search returned no results');
+  const [read, readMs] = await timed(() => client.callTool({
+    name: 'read', arguments: { path: results[0].exchange.archivePath, startLine: 1, endLine: 5 },
+  }));
+  if (read.isError) throw new Error(`${label}: read returned an error`);
+  const readOk = true;
   return { client: label, tools: list.tools.length, listMs, searchResults: results.length, searchMs, readOk, readMs };
 }
 
