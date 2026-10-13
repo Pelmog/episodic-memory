@@ -5,6 +5,8 @@ var __export = (target, all) => {
 };
 
 // src/tool-worker.ts
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import { parentPort } from "node:worker_threads";
 
 // src/db.ts
@@ -307,8 +309,20 @@ async function initEmbeddings() {
   });
   return initPromise;
 }
+async function disposeEmbeddings() {
+  await initPromise?.catch(() => {
+  });
+  const pipeline = embeddingPipeline;
+  embeddingPipeline = null;
+  initPromise = null;
+  await pipeline?.dispose().catch(() => {
+  });
+}
 async function loadPipeline() {
   if (embeddingPipeline) return;
+  if (process.env.EPISODIC_MEMORY_FORCE_EMBEDDINGS_UNAVAILABLE) {
+    throw new EmbeddingsUnavailableError("Embeddings disabled by EPISODIC_MEMORY_FORCE_EMBEDDINGS_UNAVAILABLE");
+  }
   let pipeline;
   try {
     const transformers = await import("@huggingface/transformers");
@@ -22430,7 +22444,18 @@ if (!parentPort) throw new Error("tool-worker must run inside a worker thread");
 var port = parentPort;
 configureSearchDatabase(openReadOnlyDatabase);
 port.on("message", async (message) => {
-  if (message.type === "exit") process.exit(0);
+  if (message.type === "exit") {
+    cancelWarmUpDelay();
+    await warmUpSettled;
+    await disposeEmbeddings();
+    setFlagsFromString("--expose-gc");
+    const gc = runInNewContext("gc");
+    for (let i = 0; i < 3; i++) {
+      gc();
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    process.exit(0);
+  }
   const { id, name, args } = message;
   let result;
   try {
@@ -22444,6 +22469,23 @@ var warmUpTimer;
 var warmUpTimeout = new Promise((_2, reject) => {
   warmUpTimer = setTimeout(() => reject(new Error(`timed out after ${WARM_UP_TIMEOUT_MS} ms`)), WARM_UP_TIMEOUT_MS);
 });
-Promise.race([initEmbeddings(), warmUpTimeout]).catch((error62) => {
+var warmDelayMs = Number(process.env.EPISODIC_MEMORY_TEST_WARM_DELAY_MS) || 0;
+var warmDelayTimer;
+var cancelWarmUpDelay = () => {
+};
+var warmUp = async () => {
+  if (warmDelayMs > 0) {
+    const cancelled = await new Promise((resolve) => {
+      warmDelayTimer = setTimeout(() => resolve(false), warmDelayMs);
+      cancelWarmUpDelay = () => {
+        clearTimeout(warmDelayTimer);
+        resolve(true);
+      };
+    });
+    if (cancelled) return;
+  }
+  await initEmbeddings();
+};
+var warmUpSettled = Promise.race([warmUp(), warmUpTimeout]).catch((error62) => {
   console.error(`Tool worker embedding warm-up failed: ${error62 instanceof Error ? error62.message : String(error62)}`);
 }).finally(() => clearTimeout(warmUpTimer));

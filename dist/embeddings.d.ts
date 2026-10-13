@@ -41,6 +41,12 @@ export declare class EmbeddingsUnavailableError extends Error {
  * clears so a later call retries.
  */
 export declare function initEmbeddings(): Promise<void>;
+/**
+ * Releases the ONNX session explicitly. Worker threads call this before
+ * exiting: otherwise a GC finalizer can fire after the native addon is
+ * unloaded during isolate teardown and crash the process with SIGSEGV.
+ */
+export declare function disposeEmbeddings(): Promise<void>;
 export declare function generateEmbedding(text: string): Promise<number[]>;
 /**
  * Prepend the BGE retrieval prefix to a query string. Idempotent: returns

@@ -11,7 +11,9 @@
     "test/mcp-server.test.ts",
     "test/read-policy.test.ts",
     "test/tool-pool.test.ts",
-    "test/http.test.ts"
+    "test/http.test.ts",
+    "test/http-startup.test.ts",
+    "test/http-bundle.test.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }

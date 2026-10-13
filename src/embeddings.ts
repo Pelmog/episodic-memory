@@ -80,8 +80,27 @@ export async function initEmbeddings(): Promise<void> {
   return initPromise;
 }
 
+/**
+ * Releases the ONNX session explicitly. Worker threads call this before
+ * exiting: otherwise a GC finalizer can fire after the native addon is
+ * unloaded during isolate teardown and crash the process with SIGSEGV.
+ */
+export async function disposeEmbeddings(): Promise<void> {
+  await initPromise?.catch(() => {});
+  const pipeline = embeddingPipeline;
+  embeddingPipeline = null;
+  initPromise = null;
+  await pipeline?.dispose().catch(() => {});
+}
+
 async function loadPipeline(): Promise<void> {
   if (embeddingPipeline) return;
+
+  // TEST-ONLY: simulate an unavailable backend in processes (e.g. worker
+  // threads) where vi.mock cannot reach. Never set in production.
+  if (process.env.EPISODIC_MEMORY_FORCE_EMBEDDINGS_UNAVAILABLE) {
+    throw new EmbeddingsUnavailableError('Embeddings disabled by EPISODIC_MEMORY_FORCE_EMBEDDINGS_UNAVAILABLE');
+  }
 
   // Load @huggingface/transformers lazily. Its module graph eagerly requires
   // `sharp`, so a static top-level import would crash *every* consumer of this

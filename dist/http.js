@@ -1,10 +1,12 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { timingSafeEqual } from 'node:crypto';
+import { lstat, readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { fileURLToPath } from 'node:url';
 import { createMcpHandler, isLegacyRequest, WebStandardStreamableHTTPServerTransport, } from '@modelcontextprotocol/server';
 import { localhostHostValidation, localhostOriginValidation, toNodeHandler } from '@modelcontextprotocol/node';
 import { createEpisodicServer } from './mcp-factory.js';
-import { PoolBusyError } from './tool-pool.js';
+import { createToolPool, PoolBusyError } from './tool-pool.js';
 export const MAX_BODY_BYTES = 1048576;
 export const MAX_ADMITTED = 16;
 /**
@@ -160,6 +162,111 @@ export function createEpisodicHttpServer(token, execute) {
         },
     };
 }
-export async function startHttp() {
-    throw new Error('HTTP mode not built yet');
+const DEFAULT_PORT = 8734;
+const POOL_CLOSE_BOUND_MS = 10_000;
+function intFromEnv(env, name, fallback) {
+    const raw = env[name];
+    if (raw === undefined || raw === '')
+        return fallback;
+    if (!/^\d+$/.test(raw))
+        throw new Error(`${name} must be a whole number.`);
+    return Number(raw);
+}
+/**
+ * Validates the shared-service configuration. The bearer token is read from a
+ * file (never argv or env) that must be a regular file owned by this user with
+ * mode exactly 0600.
+ */
+export async function readHttpConfig(env) {
+    const tokenFile = env.EPISODIC_MEMORY_HTTP_TOKEN_FILE;
+    if (!tokenFile)
+        throw new Error('EPISODIC_MEMORY_HTTP_TOKEN_FILE is required.');
+    let info;
+    try {
+        info = await lstat(tokenFile);
+    }
+    catch {
+        throw new Error('EPISODIC_MEMORY_HTTP_TOKEN_FILE cannot be read.');
+    }
+    if (!info.isFile())
+        throw new Error('EPISODIC_MEMORY_HTTP_TOKEN_FILE must be a regular file.');
+    if (typeof process.getuid === 'function' && info.uid !== process.getuid()) {
+        throw new Error('EPISODIC_MEMORY_HTTP_TOKEN_FILE must be owned by the current user.');
+    }
+    if ((info.mode & 0o777) !== 0o600)
+        throw new Error('EPISODIC_MEMORY_HTTP_TOKEN_FILE must have mode 0600.');
+    // Tolerate the trailing newline editors and `echo` add; interior whitespace is rejected below.
+    const token = (await readFile(tokenFile, 'utf8')).replace(/[\r\n]+$/, '');
+    if (Buffer.byteLength(token) < 32 || /\s/.test(token)) {
+        throw new Error('HTTP bearer token must contain at least 32 bytes without whitespace.');
+    }
+    const port = intFromEnv(env, 'EPISODIC_MEMORY_HTTP_PORT', DEFAULT_PORT);
+    if (!((port >= 1024 && port <= 65535) || (port === 0 && process.env.VITEST))) {
+        throw new Error('EPISODIC_MEMORY_HTTP_PORT must be between 1024 and 65535.');
+    }
+    const workers = intFromEnv(env, 'EPISODIC_MEMORY_HTTP_WORKERS', 3);
+    if (workers < 1 || workers > 8)
+        throw new Error('EPISODIC_MEMORY_HTTP_WORKERS must be between 1 and 8.');
+    const deadlineMs = intFromEnv(env, 'EPISODIC_MEMORY_TOOL_DEADLINE_MS', 100_000);
+    if (deadlineMs < 1000)
+        throw new Error('EPISODIC_MEMORY_TOOL_DEADLINE_MS must be at least 1000.');
+    return { port, token, workers, deadlineMs };
+}
+/**
+ * Starts the shared HTTP service on 127.0.0.1. Embedding warm-up happens in the
+ * workers in the background and never gates binding.
+ *
+ * Test-only environment variables (read by the workers, never set in production):
+ *  - EPISODIC_MEMORY_FORCE_EMBEDDINGS_UNAVAILABLE=1  (src/embeddings.ts)
+ *  - EPISODIC_MEMORY_TEST_WARM_DELAY_MS=<ms>         (src/tool-worker.ts warm-up delay)
+ */
+export async function startHttp(options = {}) {
+    const { port: requestedPort, token, workers, deadlineMs } = await readHttpConfig(process.env);
+    const pool = createToolPool({
+        workerPath: options.workerPath ?? fileURLToPath(new URL('./tool-worker.js', import.meta.url)),
+        size: workers,
+        deadlineMs,
+        maxQueue: 64,
+    });
+    const service = createEpisodicHttpServer(token, pool.run);
+    try {
+        await new Promise((resolve, reject) => {
+            service.http.once('error', reject);
+            service.http.listen(requestedPort, '127.0.0.1', () => {
+                service.http.off('error', reject);
+                resolve();
+            });
+        });
+    }
+    catch (error) {
+        await pool.close().catch(() => { });
+        throw error;
+    }
+    const port = service.http.address().port;
+    let closing;
+    const close = () => {
+        closing ??= (async () => {
+            // close() rejects with ERR_SERVER_NOT_RUNNING if the server is not listening.
+            if (service.http.listening)
+                await service.close().catch(() => { });
+            let timer;
+            const bound = new Promise((resolve) => {
+                timer = setTimeout(() => resolve('timeout'), POOL_CLOSE_BOUND_MS);
+            });
+            const outcome = await Promise.race([pool.close().then(() => 'closed', () => 'closed'), bound]);
+            clearTimeout(timer);
+            if (outcome === 'timeout')
+                process.stderr.write('episodic-memory shutdown: worker pool did not close within 10 s\n');
+        })();
+        return closing;
+    };
+    if (!process.env.VITEST) {
+        for (const signal of ['SIGINT', 'SIGTERM']) {
+            process.once(signal, () => {
+                close().finally(() => process.exit(0));
+            });
+        }
+    }
+    process.stderr.write(`episodic-memory HTTP ready on 127.0.0.1:${port} (${workers} workers)\n`);
+    return { port, close };
 }

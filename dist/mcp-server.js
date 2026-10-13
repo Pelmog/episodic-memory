@@ -36913,6 +36913,9 @@ async function initEmbeddings() {
 }
 async function loadPipeline() {
   if (embeddingPipeline) return;
+  if (process.env.EPISODIC_MEMORY_FORCE_EMBEDDINGS_UNAVAILABLE) {
+    throw new EmbeddingsUnavailableError("Embeddings disabled by EPISODIC_MEMORY_FORCE_EMBEDDINGS_UNAVAILABLE");
+  }
   let pipeline;
   try {
     const transformers = await import("@huggingface/transformers");
@@ -39852,7 +39855,152 @@ var init_dist3 = __esm({
 });
 
 // src/tool-pool.ts
-var PoolBusyError;
+import { Worker } from "node:worker_threads";
+function createToolPool(options) {
+  const { workerPath, size, deadlineMs, maxQueue } = options;
+  const slots = Array.from({ length: size }, () => ({ worker: null, busy: null, awaitingCapacity: false }));
+  const queue = [];
+  const live = /* @__PURE__ */ new Map();
+  const maxLive = 2 * size;
+  let nextId = 1;
+  let closed = false;
+  const canSpawn = () => !closed && live.size < maxLive;
+  const usable = (s) => s.busy === null && (s.worker !== null || canSpawn());
+  function onWorkerExit(worker) {
+    live.delete(worker);
+    for (const slot of slots) {
+      if (slot.awaitingCapacity && slot.worker === null && canSpawn()) spawn(slot);
+    }
+    dispatch();
+  }
+  function spawn(slot) {
+    const worker = new Worker(workerPath);
+    let exited;
+    live.set(worker, new Promise((resolve) => {
+      exited = resolve;
+    }));
+    slot.awaitingCapacity = false;
+    worker.on("message", (reply) => {
+      if (slot.worker === worker && slot.busy !== null && slot.busy.id === reply?.id) finish(slot, reply.result);
+    });
+    const lost = (error62) => {
+      if (slot.worker !== worker) return;
+      slot.worker = null;
+      if (closed) return;
+      if (error62 instanceof Error) console.error(`Tool worker crashed: ${error62.message}`);
+      if (slot.busy) {
+        replace(slot);
+        finish(slot, errorResult(CRASHED));
+      }
+    };
+    worker.on("error", lost);
+    worker.on("exit", () => {
+      lost();
+      onWorkerExit(worker);
+      exited();
+    });
+    slot.worker = worker;
+    return worker;
+  }
+  function replace(slot) {
+    if (closed) return;
+    if (canSpawn()) spawn(slot);
+    else slot.awaitingCapacity = true;
+  }
+  function retire(slot) {
+    slot.worker?.postMessage(EXIT_MESSAGE);
+    slot.worker = null;
+    replace(slot);
+  }
+  function detach(call) {
+    clearTimeout(call.timer);
+    call.signal.removeEventListener("abort", call.onAbort);
+  }
+  function finish(slot, result) {
+    const call = slot.busy;
+    if (!call) return;
+    slot.busy = null;
+    detach(call);
+    call.resolve(result);
+    dispatch();
+  }
+  function start(slot, call) {
+    const worker = slot.worker ?? spawn(slot);
+    slot.busy = call;
+    call.timer = setTimeout(() => {
+      if (slot.busy !== call) return;
+      retire(slot);
+      finish(slot, errorResult(`Error: Tool call exceeded the ${deadlineMs} ms deadline`));
+    }, deadlineMs);
+    try {
+      worker.postMessage({ id: call.id, name: call.name, args: call.args });
+    } catch (error62) {
+      finish(slot, errorResult(`Error: ${error62 instanceof Error ? error62.message : String(error62)}`));
+    }
+  }
+  function dispatch() {
+    while (!closed && queue.length > 0) {
+      const slot = slots.find(usable);
+      if (!slot) return;
+      start(slot, queue.shift());
+    }
+  }
+  const run = async (name, args, signal) => {
+    if (closed) return errorResult(SHUTTING_DOWN);
+    if (signal.aborted) return errorResult(CANCELLED);
+    const idle = slots.find(usable);
+    if (!idle && queue.length >= maxQueue) throw new PoolBusyError();
+    return new Promise((resolve) => {
+      const call = {
+        id: nextId++,
+        name,
+        args,
+        signal,
+        resolve,
+        onAbort: () => {
+          const queued = queue.indexOf(call);
+          if (queued >= 0) {
+            queue.splice(queued, 1);
+            detach(call);
+            resolve(errorResult(CANCELLED));
+            return;
+          }
+          const slot = slots.find((s) => s.busy === call);
+          if (!slot) return;
+          retire(slot);
+          finish(slot, errorResult(CANCELLED));
+        }
+      };
+      signal.addEventListener("abort", call.onAbort, { once: true });
+      if (idle) start(idle, call);
+      else queue.push(call);
+    });
+  };
+  async function close() {
+    if (!closed) {
+      closed = true;
+      const pending = [...queue.splice(0), ...slots.flatMap((s) => s.busy ? [s.busy] : [])];
+      for (const slot of slots) {
+        slot.busy = null;
+        slot.worker = null;
+        slot.awaitingCapacity = false;
+      }
+      for (const call of pending) {
+        detach(call);
+        call.resolve(errorResult(SHUTTING_DOWN));
+      }
+      for (const worker of live.keys()) worker.postMessage(EXIT_MESSAGE);
+    }
+    await Promise.all(live.values());
+  }
+  for (const slot of slots) spawn(slot);
+  return {
+    run,
+    close,
+    stats: () => ({ busy: slots.filter((s) => s.busy !== null).length, queued: queue.length, size, live: live.size })
+  };
+}
+var PoolBusyError, errorResult, CANCELLED, CRASHED, SHUTTING_DOWN, EXIT_MESSAGE;
 var init_tool_pool = __esm({
   "src/tool-pool.ts"() {
     "use strict";
@@ -39862,6 +40010,11 @@ var init_tool_pool = __esm({
         this.name = "PoolBusyError";
       }
     };
+    errorResult = (text) => ({ isError: true, content: [{ type: "text", text }] });
+    CANCELLED = "Error: Request cancelled";
+    CRASHED = "Error: Tool worker crashed";
+    SHUTTING_DOWN = "Error: Tool pool is shutting down";
+    EXIT_MESSAGE = { type: "exit" };
   }
 });
 
@@ -39871,11 +40024,14 @@ __export(http_exports, {
   MAX_ADMITTED: () => MAX_ADMITTED,
   MAX_BODY_BYTES: () => MAX_BODY_BYTES,
   createEpisodicHttpServer: () => createEpisodicHttpServer,
+  readHttpConfig: () => readHttpConfig,
   startHttp: () => startHttp
 });
 import { AsyncLocalStorage } from "node:async_hooks";
 import { timingSafeEqual } from "node:crypto";
+import { lstat, readFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { fileURLToPath } from "node:url";
 function createEpisodicHttpServer(token, execute) {
   if (Buffer.byteLength(token) < 32 || /\s/.test(token)) {
     throw new Error("HTTP bearer token must contain at least 32 bytes without whitespace.");
@@ -40001,10 +40157,90 @@ function createEpisodicHttpServer(token, execute) {
     }
   };
 }
-async function startHttp() {
-  throw new Error("HTTP mode not built yet");
+function intFromEnv(env, name, fallback) {
+  const raw = env[name];
+  if (raw === void 0 || raw === "") return fallback;
+  if (!/^\d+$/.test(raw)) throw new Error(`${name} must be a whole number.`);
+  return Number(raw);
 }
-var MAX_BODY_BYTES, MAX_ADMITTED;
+async function readHttpConfig(env) {
+  const tokenFile = env.EPISODIC_MEMORY_HTTP_TOKEN_FILE;
+  if (!tokenFile) throw new Error("EPISODIC_MEMORY_HTTP_TOKEN_FILE is required.");
+  let info;
+  try {
+    info = await lstat(tokenFile);
+  } catch {
+    throw new Error("EPISODIC_MEMORY_HTTP_TOKEN_FILE cannot be read.");
+  }
+  if (!info.isFile()) throw new Error("EPISODIC_MEMORY_HTTP_TOKEN_FILE must be a regular file.");
+  if (typeof process.getuid === "function" && info.uid !== process.getuid()) {
+    throw new Error("EPISODIC_MEMORY_HTTP_TOKEN_FILE must be owned by the current user.");
+  }
+  if ((info.mode & 511) !== 384) throw new Error("EPISODIC_MEMORY_HTTP_TOKEN_FILE must have mode 0600.");
+  const token = (await readFile(tokenFile, "utf8")).replace(/[\r\n]+$/, "");
+  if (Buffer.byteLength(token) < 32 || /\s/.test(token)) {
+    throw new Error("HTTP bearer token must contain at least 32 bytes without whitespace.");
+  }
+  const port = intFromEnv(env, "EPISODIC_MEMORY_HTTP_PORT", DEFAULT_PORT);
+  if (!(port >= 1024 && port <= 65535 || port === 0 && process.env.VITEST)) {
+    throw new Error("EPISODIC_MEMORY_HTTP_PORT must be between 1024 and 65535.");
+  }
+  const workers = intFromEnv(env, "EPISODIC_MEMORY_HTTP_WORKERS", 3);
+  if (workers < 1 || workers > 8) throw new Error("EPISODIC_MEMORY_HTTP_WORKERS must be between 1 and 8.");
+  const deadlineMs = intFromEnv(env, "EPISODIC_MEMORY_TOOL_DEADLINE_MS", 1e5);
+  if (deadlineMs < 1e3) throw new Error("EPISODIC_MEMORY_TOOL_DEADLINE_MS must be at least 1000.");
+  return { port, token, workers, deadlineMs };
+}
+async function startHttp(options = {}) {
+  const { port: requestedPort, token, workers, deadlineMs } = await readHttpConfig(process.env);
+  const pool = createToolPool({
+    workerPath: options.workerPath ?? fileURLToPath(new URL("./tool-worker.js", import.meta.url)),
+    size: workers,
+    deadlineMs,
+    maxQueue: 64
+  });
+  const service = createEpisodicHttpServer(token, pool.run);
+  try {
+    await new Promise((resolve, reject) => {
+      service.http.once("error", reject);
+      service.http.listen(requestedPort, "127.0.0.1", () => {
+        service.http.off("error", reject);
+        resolve();
+      });
+    });
+  } catch (error62) {
+    await pool.close().catch(() => {
+    });
+    throw error62;
+  }
+  const port = service.http.address().port;
+  let closing;
+  const close = () => {
+    closing ??= (async () => {
+      if (service.http.listening) await service.close().catch(() => {
+      });
+      let timer;
+      const bound = new Promise((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), POOL_CLOSE_BOUND_MS);
+      });
+      const outcome = await Promise.race([pool.close().then(() => "closed", () => "closed"), bound]);
+      clearTimeout(timer);
+      if (outcome === "timeout") process.stderr.write("episodic-memory shutdown: worker pool did not close within 10 s\n");
+    })();
+    return closing;
+  };
+  if (!process.env.VITEST) {
+    for (const signal of ["SIGINT", "SIGTERM"]) {
+      process.once(signal, () => {
+        close().finally(() => process.exit(0));
+      });
+    }
+  }
+  process.stderr.write(`episodic-memory HTTP ready on 127.0.0.1:${port} (${workers} workers)
+`);
+  return { port, close };
+}
+var MAX_BODY_BYTES, MAX_ADMITTED, DEFAULT_PORT, POOL_CLOSE_BOUND_MS;
 var init_http = __esm({
   "src/http.ts"() {
     "use strict";
@@ -40014,6 +40250,8 @@ var init_http = __esm({
     init_tool_pool();
     MAX_BODY_BYTES = 1048576;
     MAX_ADMITTED = 16;
+    DEFAULT_PORT = 8734;
+    POOL_CLOSE_BOUND_MS = 1e4;
   }
 });
 
