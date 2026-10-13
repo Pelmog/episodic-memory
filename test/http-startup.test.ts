@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -6,11 +6,6 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 
-vi.mock('node:fs/promises', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:fs/promises')>();
-  return { ...actual, lstat: vi.fn(actual.lstat) };
-});
-import { lstat } from 'node:fs/promises';
 import { readHttpConfig, startHttp } from '../src/http.js';
 // @ts-expect-error plain .mjs script without type declarations
 import { FIXTURE_DIR } from '../scripts/capture-mcp-baseline.mjs';
@@ -100,12 +95,15 @@ describe('readHttpConfig', () => {
   });
 
   it('rejects a file owned by another uid', async () => {
-    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
-    vi.mocked(lstat).mockImplementationOnce((async (path: string) => {
-      const info = await actual.lstat(path);
-      return Object.assign(Object.create(Object.getPrototypeOf(info)), info, { uid: process.getuid!() + 1 });
-    }) as never);
-    await expect(readHttpConfig(base())).rejects.toThrow(/owned by the current user/);
+    // The token file is ours; pretend the service runs as a different user.
+    const realGetuid = process.getuid;
+    if (!realGetuid) return; // no uids on this platform
+    process.getuid = () => realGetuid.call(process) + 1;
+    try {
+      await expect(readHttpConfig(base())).rejects.toThrow(/owned by the current user/);
+    } finally {
+      process.getuid = realGetuid;
+    }
   });
 
   it('rejects short or whitespace-containing tokens without echoing them', async () => {

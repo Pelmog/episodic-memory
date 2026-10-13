@@ -126,8 +126,8 @@ describe('search -> read roundtrip', () => {
       const { resolveReadablePath } = await import('../src/read-policy.js');
       const search = await callTool('search', { query: 'zebra widget cache', mode: 'text', response_format: 'json' });
       expect(search.isError).toBeFalsy();
-      const parsed = JSON.parse(search.content[0].text);
-      const paths: string[] = (parsed.results ?? parsed).map((x: any) => x.exchange.archivePath);
+      const parsed: { results: Array<{ exchange: { archivePath: string } }> } = JSON.parse(search.content[0].text);
+      const paths = parsed.results.map((x) => x.exchange.archivePath);
       expect(paths.length).toBeGreaterThan(0);
       for (const p of paths) {
         const res = await callTool('read', { path: p }, { resolveReadPath: (q) => resolveReadablePath(q) });

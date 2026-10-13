@@ -29,25 +29,26 @@ describe('search closes its DB handle on failure', () => {
 
   it('closes when the vector path throws', async () => {
     const real = initDatabase();
-    const close = vi.fn(() => real.close());
-    const fake = new Proxy(real, {
-      get: (t, p) => (p === 'close' ? close : (t as any)[p]?.bind?.(t) ?? (t as any)[p]),
-    });
-    configureSearchDatabase(() => fake as any);
-    await expect(searchConversations('hello', { mode: 'vector' })).rejects.toThrow('boom');
-    expect(close).toHaveBeenCalledTimes(1);
+    const close = vi.spyOn(real, 'close');
+    try {
+      configureSearchDatabase(() => real);
+      await expect(searchConversations('hello', { mode: 'vector' })).rejects.toThrow('boom');
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      if (real.open) real.close();
+    }
   });
 
   it('closes when the text path throws', async () => {
     const real = initDatabase();
-    const close = vi.fn(() => real.close());
-    const fake = {
-      prepare: () => { throw new Error('prepare failed'); },
-      close,
-    };
-    configureSearchDatabase(() => fake as any);
-    await expect(searchConversations('hello', { mode: 'text' })).rejects.toThrow('prepare failed');
-    expect(close).toHaveBeenCalledTimes(1);
-    real.close();
+    const close = vi.spyOn(real, 'close');
+    vi.spyOn(real, 'prepare').mockImplementation(() => { throw new Error('prepare failed'); });
+    try {
+      configureSearchDatabase(() => real);
+      await expect(searchConversations('hello', { mode: 'text' })).rejects.toThrow('prepare failed');
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      if (real.open) real.close();
+    }
   });
 });

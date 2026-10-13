@@ -25,10 +25,11 @@ describe('openReadOnlyDatabase', () => {
     const db = openReadOnlyDatabase();
     try {
       expect(db.prepare('SELECT COUNT(*) AS c FROM exchanges').get()).toEqual({ c: 0 });
-      expect(() => db.prepare('DELETE FROM exchanges').run()).toThrow(/readonly/i);
-      try { db.prepare('DELETE FROM exchanges').run(); } catch (e: any) {
-        expect(String(e.code)).toMatch(/SQLITE_READONLY/);
-      }
+      let caught: unknown;
+      try { db.prepare('DELETE FROM exchanges').run(); } catch (e) { caught = e; }
+      expect(caught).toBeInstanceOf(Error);
+      expect(String(caught)).toMatch(/readonly/i);
+      expect(caught).toMatchObject({ code: expect.stringMatching(/SQLITE_READONLY/) });
     } finally {
       db.close();
     }
