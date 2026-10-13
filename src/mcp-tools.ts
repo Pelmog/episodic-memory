@@ -14,12 +14,20 @@ import { formatConversationAsMarkdown } from './show.js';
 import { z } from 'zod';
 import fs from 'fs';
 
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
 export type ToolDefinition = {
   name: string;
   description: string;
   inputSchema: {
     type: 'object';
-    properties: Record<string, unknown>;
+    properties: { [key: string]: JsonValue };
     required: string[];
     additionalProperties: boolean;
   };

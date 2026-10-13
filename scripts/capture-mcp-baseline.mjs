@@ -61,7 +61,11 @@ function normaliser(root) {
 }
 
 /** Runs the baseline calls against `serverPath`; returns { catalog, searchJson, searchMarkdown, read } strings. */
-export async function runBaseline({ serverPath = join(repoRoot, 'dist', 'mcp-server.js') } = {}) {
+export async function runBaseline({
+  serverPath = join(repoRoot, 'dist', 'mcp-server.js'),
+  // Client/transport classes to drive the server with; defaults to the legacy v1 SDK client.
+  kit = { Client, StdioClientTransport },
+} = {}) {
   const root = mkdtempSync(join(tmpdir(), 'em-baseline-'));
   const env = isolatedEnv(root);
   for (const d of ['home', 'archive', 'config', 'projects/baseline-project']) mkdirSync(join(root, d), { recursive: true });
@@ -73,8 +77,8 @@ export async function runBaseline({ serverPath = join(repoRoot, 'dist', 'mcp-ser
   });
   if (index.status !== 0) throw new Error(`indexing failed (${index.status}): ${index.stdout}\n${index.stderr}`);
 
-  const client = new Client({ name: 'episodic-memory-baseline', version: '1.0.0' }, { capabilities: {} });
-  const transport = new StdioClientTransport({ command: process.execPath, args: [serverPath], stderr: 'pipe', env });
+  const client = new kit.Client({ name: 'episodic-memory-baseline', version: '1.0.0' }, { capabilities: {} });
+  const transport = new kit.StdioClientTransport({ command: process.execPath, args: [serverPath], stderr: 'pipe', env });
   try {
     await client.connect(transport);
     const norm = normaliser(root);

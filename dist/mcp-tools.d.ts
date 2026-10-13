@@ -2,12 +2,17 @@
  * SDK-agnostic MCP tool surface for Episodic Memory: tool definitions and the
  * call handler. Transport layers (stdio today, HTTP later) wrap callTool().
  */
+export type JsonValue = string | number | boolean | null | JsonValue[] | {
+    [key: string]: JsonValue;
+};
 export type ToolDefinition = {
     name: string;
     description: string;
     inputSchema: {
         type: 'object';
-        properties: Record<string, unknown>;
+        properties: {
+            [key: string]: JsonValue;
+        };
         required: string[];
         additionalProperties: boolean;
     };
