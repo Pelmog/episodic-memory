@@ -63,11 +63,27 @@ export class EmbeddingsUnavailableError extends Error {
     }
 }
 let initPromise = null;
+// Set once disposeEmbeddings() starts: no new model load may begin after that.
+let disposed = false;
+// Shared-service workers turn remote downloads off (configureEmbeddings), so an
+// unusable model cache fails fast instead of waiting on the network.
+let allowRemoteModels;
+/**
+ * Process-wide loading options; call before the first load. Only the shared
+ * HTTP service's worker threads use this; stdio and CLI paths keep the
+ * library defaults.
+ */
+export function configureEmbeddings(options) {
+    allowRemoteModels = options.allowRemoteModels;
+}
 /**
  * Singleflight: concurrent callers share one in-flight load; a failed load
- * clears so a later call retries.
+ * clears so a later call retries. After disposeEmbeddings() has begun it
+ * throws EmbeddingsUnavailableError instead of loading.
  */
 export async function initEmbeddings() {
+    if (disposed)
+        throw new EmbeddingsUnavailableError('Embeddings were disposed (tool worker is exiting)');
     if (embeddingPipeline)
         return;
     initPromise ??= loadPipeline().finally(() => { if (!embeddingPipeline)
@@ -78,8 +94,11 @@ export async function initEmbeddings() {
  * Releases the ONNX session explicitly. Worker threads call this before
  * exiting: otherwise a GC finalizer can fire after the native addon is
  * unloaded during isolate teardown and crash the process with SIGSEGV.
+ * An in-flight load is awaited (exiting mid-load crashes the process); no new
+ * load can start once this has been called.
  */
 export async function disposeEmbeddings() {
+    disposed = true;
     await initPromise?.catch(() => { });
     const pipeline = embeddingPipeline;
     embeddingPipeline = null;
@@ -106,6 +125,8 @@ async function loadPipeline() {
         // MCP context, where stdout is reserved for JSON-RPC communication.
         transformers.env.allowLocalModels = true;
         transformers.env.useBrowserCache = false;
+        if (allowRemoteModels !== undefined)
+            transformers.env.allowRemoteModels = allowRemoteModels;
         pipeline = transformers.pipeline;
     }
     catch (error) {
@@ -133,6 +154,8 @@ export async function generateEmbedding(text) {
     if (!embeddingPipeline) {
         await initEmbeddings();
     }
+    if (!embeddingPipeline)
+        throw new EmbeddingsUnavailableError('Embeddings were disposed (tool worker is exiting)');
     // Truncate text to avoid token limits (512 tokens max for bge-small).
     // Empirically, retrieval quality is best at the 2000-char truncation limit;
     // longer inputs degrade mean-pooled embeddings.

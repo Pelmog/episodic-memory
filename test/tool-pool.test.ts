@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -157,6 +157,50 @@ describe('tool pool (fixture worker)', () => {
       clearInterval(sample);
     }
     expect(maxLive).toBe(2);
+  });
+
+  it('watchdog: calls onWedged once when a retiring worker outlives 2 × deadline', async () => {
+    const onWedged = vi.fn();
+    const p = pool({ size: 1, deadlineMs: 200, onWedged });
+    await warm(p, 1);
+    const t0 = Date.now();
+    expect(text(await p.run('block', { ms: 2000 }, never()))).toMatch(/deadline/);
+    // Retired at ~200 ms and still spinning: wedged once it is past 2 × 200 ms in retirement.
+    while (onWedged.mock.calls.length === 0 && Date.now() - t0 < 1500) await sleep(20);
+    expect(onWedged).toHaveBeenCalledTimes(1);
+    expect(onWedged.mock.calls[0][0]).toMatch(/retiring/);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(550);
+    await sleep(400);
+    expect(onWedged).toHaveBeenCalledTimes(1);
+  });
+
+  it('watchdog: calls onWedged when the pool is stuck at the cap with calls queued', async () => {
+    const onWedged = vi.fn();
+    const p = pool({ size: 1, deadlineMs: 200, maxQueue: 1, onWedged });
+    await warm(p, 1);
+    expect(text(await p.run('block', { ms: 2500 }, never()))).toMatch(/deadline/);
+    expect(text(await p.run('block', { ms: 2500 }, never()))).toMatch(/deadline/);
+    const queued = p.run('fast', {}, never());
+    expect(p.stats()).toEqual({ busy: 0, queued: 1, size: 1, live: 2 });
+    const t0 = Date.now();
+    while (onWedged.mock.calls.length === 0 && Date.now() - t0 < 1500) await sleep(20);
+    expect(onWedged).toHaveBeenCalledTimes(1);
+    expect(text(await queued)).toMatch(/^fast:/); // the pool itself still recovers once a worker exits
+  });
+
+  it('watchdog: a healthy pool (including fast-exiting retirements) never calls onWedged', async () => {
+    const onWedged = vi.fn();
+    const p = pool({ size: 2, deadlineMs: 200, onWedged });
+    await warm(p, 2);
+    const t0 = Date.now();
+    // A retirement whose worker exits within 2 × deadline (block ends at ~300 ms).
+    expect(text(await p.run('block', { ms: 300 }, never()))).toMatch(/deadline/);
+    while (Date.now() - t0 < 1200) {
+      const results = await Promise.all([p.run('block', { ms: 50 }, never()), p.run('fast', {}, never())]);
+      for (const r of results) expect(r.isError).toBeFalsy();
+    }
+    await sleep(300);
+    expect(onWedged).not.toHaveBeenCalled();
   });
 
   it('reports a crashed worker and respawns it', async () => {

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { Client as ModernClient, StreamableHTTPClientTransport as ModernTransport } from '@modelcontextprotocol/client';
 import { Client as LegacyClient } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport as LegacyTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { createEpisodicHttpServer, MAX_ADMITTED, MAX_BODY_BYTES } from '../src/http.js';
+import { createEpisodicHttpServer, MAX_ADMITTED, MAX_ADMITTED_OTHER, MAX_BODY_BYTES } from '../src/http.js';
 import { PoolBusyError } from '../src/tool-pool.js';
 import type { ToolExecutor } from '../src/mcp-factory.js';
 // @ts-expect-error plain .mjs script without type declarations
@@ -250,6 +250,18 @@ describe('admission', () => {
       while (entered < MAX_ADMITTED && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
       expect(entered).toBe(MAX_ADMITTED);
       expect(await statusOf(call(clients[MAX_ADMITTED]))).toBe(503);
+      // The 16-slot cap is for tools/call only: new sessions still connect and list tools.
+      const fresh = await modernClient(url);
+      expect((await fresh.listTools()).tools).toHaveLength(2);
+      const freshLegacy = await legacyClient(url);
+      expect((await freshLegacy.listTools()).tools).toHaveLength(2);
+      // A batch containing any tools/call counts against the tools/call cap.
+      const post = (body: unknown) => fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+      const listMsg = { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} };
+      const callMsg = { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'search', arguments: { query: 'abc' } } };
+      expect((await post([listMsg, callMsg])).status).toBe(503);
+      expect((await post(callMsg)).status).toBe(503);
+      expect(MAX_ADMITTED_OTHER).toBe(64);
     } finally {
       release();
     }

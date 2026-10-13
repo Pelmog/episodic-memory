@@ -16,7 +16,14 @@ import { createEpisodicServer, type ToolExecutor } from './mcp-factory.js';
 import { createToolPool, PoolBusyError } from './tool-pool.js';
 
 export const MAX_BODY_BYTES = 1048576;
+/** Concurrent requests that contain a `tools/call` (single or in a batch). */
 export const MAX_ADMITTED = 16;
+/** Concurrent other requests (initialize, notifications, tools/list, ping), so sessions can connect while tools run. */
+export const MAX_ADMITTED_OTHER = 64;
+
+const isToolsCall = (message: unknown): boolean =>
+  typeof message === 'object' && message !== null && (message as { method?: unknown }).method === 'tools/call';
+const containsToolsCall = (body: unknown): boolean => (Array.isArray(body) ? body.some(isToolsCall) : isToolsCall(body));
 
 type RequestState = { busy: boolean };
 
@@ -107,7 +114,9 @@ export function createEpisodicHttpServer(
   });
   const validHost = localhostHostValidation();
   const validOrigin = localhostOriginValidation();
-  let active = 0;
+  let activeCalls = 0;
+  let activeOther = 0;
+  let reading = 0;
 
   const http = createServer(async (req, res) => {
     if (!validHost(req, res) || !validOrigin(req, res)) return;
@@ -124,11 +133,13 @@ export function createEpisodicHttpServer(
       res.writeHead(405, { Allow: 'POST' }).end();
       return;
     }
-    if (active >= MAX_ADMITTED) {
+    // Bounds concurrent body reads (each <= 1 MiB) before a request is classified.
+    if (reading + activeCalls + activeOther >= MAX_ADMITTED + MAX_ADMITTED_OTHER) {
       res.writeHead(503, { 'Retry-After': '1' }).end();
       return;
     }
-    active++;
+    let body: unknown;
+    reading++;
     try {
       // Bound memory before the SDK adapter buffers/parses the body.
       const chunks: Buffer[] = [];
@@ -141,19 +152,35 @@ export function createEpisodicHttpServer(
         }
         chunks.push(Buffer.from(chunk));
       }
-      let body: unknown;
       try {
         body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
       } catch {
         res.writeHead(400).end();
         return;
       }
+    } catch {
+      // The client went away mid-body.
+      if (!res.headersSent) res.writeHead(400).end();
+      else res.destroy();
+      return;
+    } finally {
+      reading--;
+    }
+    const toolCall = containsToolsCall(body);
+    if (toolCall ? activeCalls >= MAX_ADMITTED : activeOther >= MAX_ADMITTED_OTHER) {
+      res.writeHead(503, { 'Retry-After': '1' }).end();
+      return;
+    }
+    if (toolCall) activeCalls++;
+    else activeOther++;
+    try {
       await handle(req, res, body);
     } catch {
       if (!res.headersSent) res.writeHead(500).end();
       else res.destroy();
     } finally {
-      active--;
+      if (toolCall) activeCalls--;
+      else activeOther--;
     }
   });
   // Request receipt only; tool execution is bounded by the pool deadline.
@@ -218,21 +245,40 @@ export async function readHttpConfig(
   return { port, token, workers, deadlineMs };
 }
 
+/** Waits for `pool.close()` at most `boundMs`; launchd's ExitTimeOut covers anything left. */
+async function closePoolBounded(pool: { close(): Promise<void> }, boundMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bound = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), boundMs);
+  });
+  const outcome = await Promise.race([pool.close().then(() => 'closed' as const, () => 'closed' as const), bound]);
+  clearTimeout(timer);
+  if (outcome === 'timeout') process.stderr.write(`episodic-memory shutdown: worker pool did not close within ${boundMs / 1000} s\n`);
+}
+
 /**
  * Starts the shared HTTP service on 127.0.0.1. Embedding warm-up happens in the
  * workers in the background and never gates binding.
+ *
+ * Options (all test-only overrides): `workerPath`; `poolCloseBoundMs` (default 10 s);
+ * `onWedged`, called once if the pool watchdog finds it wedged (default: exit 1 so
+ * launchd's KeepAlive restarts the service).
  *
  * Test-only environment variables (read by the workers, never set in production):
  *  - EPISODIC_MEMORY_FORCE_EMBEDDINGS_UNAVAILABLE=1  (src/embeddings.ts)
  *  - EPISODIC_MEMORY_TEST_WARM_DELAY_MS=<ms>         (src/tool-worker.ts warm-up delay)
  */
-export async function startHttp(options: { workerPath?: string } = {}): Promise<{ port: number; close(): Promise<void> }> {
+export async function startHttp(
+  options: { workerPath?: string; poolCloseBoundMs?: number; onWedged?: (reason: string) => void } = {},
+): Promise<{ port: number; close(): Promise<void> }> {
   const { port: requestedPort, token, workers, deadlineMs } = await readHttpConfig(process.env);
+  const poolCloseBoundMs = options.poolCloseBoundMs ?? POOL_CLOSE_BOUND_MS;
   const pool = createToolPool({
     workerPath: options.workerPath ?? fileURLToPath(new URL('./tool-worker.js', import.meta.url)),
     size: workers,
     deadlineMs,
     maxQueue: 64,
+    onWedged: options.onWedged ?? (() => process.exit(1)),
   });
   const service = createEpisodicHttpServer(token, pool.run);
   try {
@@ -244,7 +290,7 @@ export async function startHttp(options: { workerPath?: string } = {}): Promise<
       });
     });
   } catch (error) {
-    await pool.close().catch(() => {});
+    await closePoolBounded(pool, poolCloseBoundMs);
     throw error;
   }
   const port = (service.http.address() as AddressInfo).port;
@@ -254,13 +300,7 @@ export async function startHttp(options: { workerPath?: string } = {}): Promise<
     closing ??= (async () => {
       // close() rejects with ERR_SERVER_NOT_RUNNING if the server is not listening.
       if (service.http.listening) await service.close().catch(() => {});
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const bound = new Promise<'timeout'>((resolve) => {
-        timer = setTimeout(() => resolve('timeout'), POOL_CLOSE_BOUND_MS);
-      });
-      const outcome = await Promise.race([pool.close().then(() => 'closed' as const, () => 'closed' as const), bound]);
-      clearTimeout(timer);
-      if (outcome === 'timeout') process.stderr.write('episodic-memory shutdown: worker pool did not close within 10 s\n');
+      await closePoolBounded(pool, poolCloseBoundMs);
     })();
     return closing;
   };

@@ -302,7 +302,13 @@ var EmbeddingsUnavailableError = class extends Error {
   }
 };
 var initPromise = null;
+var disposed = false;
+var allowRemoteModels;
+function configureEmbeddings(options) {
+  allowRemoteModels = options.allowRemoteModels;
+}
 async function initEmbeddings() {
+  if (disposed) throw new EmbeddingsUnavailableError("Embeddings were disposed (tool worker is exiting)");
   if (embeddingPipeline) return;
   initPromise ??= loadPipeline().finally(() => {
     if (!embeddingPipeline) initPromise = null;
@@ -310,6 +316,7 @@ async function initEmbeddings() {
   return initPromise;
 }
 async function disposeEmbeddings() {
+  disposed = true;
   await initPromise?.catch(() => {
   });
   const pipeline = embeddingPipeline;
@@ -328,6 +335,7 @@ async function loadPipeline() {
     const transformers = await import("@huggingface/transformers");
     transformers.env.allowLocalModels = true;
     transformers.env.useBrowserCache = false;
+    if (allowRemoteModels !== void 0) transformers.env.allowRemoteModels = allowRemoteModels;
     pipeline = transformers.pipeline;
   } catch (error62) {
     throw new EmbeddingsUnavailableError(
@@ -355,6 +363,7 @@ async function generateEmbedding(text) {
   if (!embeddingPipeline) {
     await initEmbeddings();
   }
+  if (!embeddingPipeline) throw new EmbeddingsUnavailableError("Embeddings were disposed (tool worker is exiting)");
   const truncated = text.substring(0, 2e3);
   const output2 = await embeddingPipeline(truncated, {
     pooling: "mean",
@@ -22425,28 +22434,61 @@ function getReadableRoots() {
   }
   return [...roots];
 }
+function locate(requested) {
+  try {
+    return { real: fs5.realpathSync(requested), exists: true };
+  } catch {
+  }
+  const rest = [];
+  let current = requested;
+  for (; ; ) {
+    const parent = path3.dirname(current);
+    if (parent === current) break;
+    rest.unshift(path3.basename(current));
+    try {
+      return { real: path3.join(fs5.realpathSync(parent), ...rest), exists: false };
+    } catch {
+      current = parent;
+    }
+  }
+  return { real: path3.resolve(requested), exists: false };
+}
+var inside = (real, roots) => roots.some((root) => real === root || real.startsWith(root + path3.sep));
 function resolveReadablePath(requested, roots = getReadableRoots()) {
   if (!path3.isAbsolute(requested)) throw new Error("Path must be absolute");
-  let real;
-  try {
-    real = fs5.realpathSync(requested);
-  } catch {
-    throw new Error(`File not found: ${requested}`);
-  }
+  const { real, exists } = locate(requested);
+  if (!inside(real, roots)) throw new Error("Path is outside the conversation archive and transcript directories");
+  if (!exists) throw new Error(`File not found: ${requested}`);
   if (!fs5.statSync(real).isFile() || path3.extname(real) !== ".jsonl") throw new Error("Only .jsonl conversation files can be read");
-  if (!roots.some((root) => real.startsWith(root + path3.sep))) throw new Error("Path is outside the conversation archive and transcript directories");
   return real;
 }
 
 // src/tool-worker.ts
 var WARM_UP_TIMEOUT_MS = 6e4;
+var EXIT_DRAIN_MS = 3e4;
 if (!parentPort) throw new Error("tool-worker must run inside a worker thread");
 var port = parentPort;
 configureSearchDatabase(openReadOnlyDatabase);
+configureEmbeddings({ allowRemoteModels: false });
+var inFlight = /* @__PURE__ */ new Set();
+var exiting = false;
 port.on("message", async (message) => {
   if (message.type === "exit") {
+    if (exiting) return;
+    exiting = true;
     cancelWarmUpDelay();
     await warmUpSettled;
+    if (inFlight.size > 0) {
+      let timer;
+      const drained = await Promise.race([
+        Promise.allSettled([...inFlight]).then(() => true),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(false), EXIT_DRAIN_MS);
+        })
+      ]);
+      clearTimeout(timer);
+      if (!drained) console.error(`Tool worker exit: in-flight call still running after ${EXIT_DRAIN_MS} ms; disposing anyway`);
+    }
     await disposeEmbeddings();
     setFlagsFromString("--expose-gc");
     const gc = runInNewContext("gc");
@@ -22457,6 +22499,16 @@ port.on("message", async (message) => {
     process.exit(0);
   }
   const { id, name, args } = message;
+  if (exiting) {
+    port.postMessage({ id, result: { isError: true, content: [{ type: "text", text: "Error: Tool worker is exiting" }] } });
+    return;
+  }
+  const served = serve(id, name, args);
+  inFlight.add(served);
+  await served;
+  inFlight.delete(served);
+});
+async function serve(id, name, args) {
   let result;
   try {
     result = await callTool(name, args, { resolveReadPath: resolveReadablePath });
@@ -22464,7 +22516,7 @@ port.on("message", async (message) => {
     result = { isError: true, content: [{ type: "text", text: `Error: ${error62 instanceof Error ? error62.message : String(error62)}` }] };
   }
   port.postMessage({ id, result });
-});
+}
 var warmUpTimer;
 var warmUpTimeout = new Promise((_2, reject) => {
   warmUpTimer = setTimeout(() => reject(new Error(`timed out after ${WARM_UP_TIMEOUT_MS} ms`)), WARM_UP_TIMEOUT_MS);

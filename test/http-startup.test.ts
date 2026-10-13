@@ -17,6 +17,7 @@ import { FIXTURE_DIR } from '../scripts/capture-mcp-baseline.mjs';
 
 const token = 'test-only-not-a-real-credential-0123456789';
 const workerPath = fileURLToPath(new URL('../dist/tool-worker.js', import.meta.url));
+const slowExitWorker = fileURLToPath(new URL('./fixtures/workers/slow-exit-worker.mjs', import.meta.url));
 const indexCli = fileURLToPath(new URL('../dist/index-cli.js', import.meta.url));
 
 let root: string;
@@ -205,5 +206,15 @@ describe('startHttp', () => {
     const first = await start();
     Object.assign(process.env, { EPISODIC_MEMORY_HTTP_PORT: String(first.service.port) });
     await expect(startHttp({ workerPath })).rejects.toThrow(/EADDRINUSE/);
+  }, 60000);
+
+  it('bounds the pool close after a failed listen', async () => {
+    const first = await start();
+    Object.assign(process.env, { EPISODIC_MEMORY_HTTP_PORT: String(first.service.port) });
+    const t0 = Date.now();
+    await expect(startHttp({ workerPath: slowExitWorker, poolCloseBoundMs: 300 })).rejects.toThrow(/EADDRINUSE/);
+    // The fixture worker takes 3 s to exit; the failed start must not wait for it.
+    expect(Date.now() - t0).toBeLessThan(2000);
+    await new Promise((resolve) => setTimeout(resolve, 3200)); // let the fixture worker exit
   }, 60000);
 });

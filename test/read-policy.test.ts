@@ -62,6 +62,21 @@ describe('resolveReadablePath', () => {
     expect(() => resolveReadablePath(join(evil, 'c.jsonl'), [archive])).toThrow(msg);
     expect(() => resolveReadablePath(join(archive, 'link.jsonl'), [archive])).toThrow(msg);
   });
+  it('gives the same "outside" message whether or not an outside path exists (no existence oracle)', async () => {
+    const { resolveReadablePath } = await import('../src/read-policy.js');
+    const msg = 'Path is outside the conversation archive and transcript directories';
+    for (const p of [
+      join(outside, 'nope.jsonl'),
+      join(outside, 'secret.jsonl'),
+      join(outside, 'nope.txt'),
+      join(root, 'no-such-dir', 'x.jsonl'),
+      join(archive, '..', 'outside', 'missing.jsonl'),
+      join(archive, 'no-such-sub', '..', '..', 'outside', 'secret.jsonl'),
+      '/definitely/not/here.jsonl',
+    ]) {
+      expect(() => resolveReadablePath(p, [archive]), p).toThrow(msg);
+    }
+  });
 });
 
 describe('getReadableRoots', () => {

@@ -36905,6 +36905,7 @@ function resolveIntraOpThreads() {
   return null;
 }
 async function initEmbeddings() {
+  if (disposed) throw new EmbeddingsUnavailableError("Embeddings were disposed (tool worker is exiting)");
   if (embeddingPipeline) return;
   initPromise ??= loadPipeline().finally(() => {
     if (!embeddingPipeline) initPromise = null;
@@ -36921,6 +36922,7 @@ async function loadPipeline() {
     const transformers = await import("@huggingface/transformers");
     transformers.env.allowLocalModels = true;
     transformers.env.useBrowserCache = false;
+    if (allowRemoteModels !== void 0) transformers.env.allowRemoteModels = allowRemoteModels;
     pipeline = transformers.pipeline;
   } catch (error62) {
     throw new EmbeddingsUnavailableError(
@@ -36948,6 +36950,7 @@ async function generateEmbedding(text) {
   if (!embeddingPipeline) {
     await initEmbeddings();
   }
+  if (!embeddingPipeline) throw new EmbeddingsUnavailableError("Embeddings were disposed (tool worker is exiting)");
   const truncated = text.substring(0, 2e3);
   const output2 = await embeddingPipeline(truncated, {
     pooling: "mean",
@@ -36962,7 +36965,7 @@ function withQueryPrefix(query) {
 async function generateQueryEmbedding(query) {
   return generateEmbedding(withQueryPrefix(query));
 }
-var MODEL_ID, MODEL_DTYPE, BGE_QUERY_PREFIX, embeddingPipeline, EmbeddingsUnavailableError, initPromise;
+var MODEL_ID, MODEL_DTYPE, BGE_QUERY_PREFIX, embeddingPipeline, EmbeddingsUnavailableError, initPromise, disposed, allowRemoteModels;
 var init_embeddings = __esm({
   "src/embeddings.ts"() {
     "use strict";
@@ -36977,6 +36980,7 @@ var init_embeddings = __esm({
       }
     };
     initPromise = null;
+    disposed = false;
   }
 });
 
@@ -39857,17 +39861,22 @@ var init_dist3 = __esm({
 // src/tool-pool.ts
 import { Worker } from "node:worker_threads";
 function createToolPool(options) {
-  const { workerPath, size, deadlineMs, maxQueue } = options;
+  const { workerPath, size, deadlineMs, maxQueue, onWedged } = options;
   const slots = Array.from({ length: size }, () => ({ worker: null, busy: null, awaitingCapacity: false }));
   const queue = [];
   const live = /* @__PURE__ */ new Map();
   const maxLive = 2 * size;
   let nextId = 1;
   let closed = false;
+  const retiredAt = /* @__PURE__ */ new Map();
+  const wedgeAfterMs = 2 * deadlineMs;
+  let stalledSince;
+  let wedged = false;
   const canSpawn = () => !closed && live.size < maxLive;
   const usable = (s) => s.busy === null && (s.worker !== null || canSpawn());
   function onWorkerExit(worker) {
     live.delete(worker);
+    retiredAt.delete(worker);
     for (const slot of slots) {
       if (slot.awaitingCapacity && slot.worker === null && canSpawn()) spawn(slot);
     }
@@ -39908,6 +39917,7 @@ function createToolPool(options) {
     else slot.awaitingCapacity = true;
   }
   function retire(slot) {
+    if (slot.worker) retiredAt.set(slot.worker, Date.now());
     slot.worker?.postMessage(EXIT_MESSAGE);
     slot.worker = null;
     replace(slot);
@@ -39926,6 +39936,7 @@ function createToolPool(options) {
   }
   function start(slot, call) {
     const worker = slot.worker ?? spawn(slot);
+    stalledSince = void 0;
     slot.busy = call;
     call.timer = setTimeout(() => {
       if (slot.busy !== call) return;
@@ -39976,9 +39987,29 @@ function createToolPool(options) {
       else queue.push(call);
     });
   };
+  function wedge(kind) {
+    wedged = true;
+    clearInterval(watchdog);
+    console.error(`episodic-memory tool pool wedged (${kind}); exiting for a restart`);
+    onWedged?.(kind);
+  }
+  function checkWedged() {
+    if (closed || wedged) return;
+    const now = Date.now();
+    for (const at of retiredAt.values()) {
+      if (now - at > wedgeAfterMs) return wedge("retiring worker did not exit");
+    }
+    const stalled = queue.length > 0 && live.size >= maxLive && !slots.some(usable);
+    if (!stalled) stalledSince = void 0;
+    else if (stalledSince === void 0) stalledSince = now;
+    else if (now - stalledSince > wedgeAfterMs) wedge("no usable worker at the cap");
+  }
+  const watchdog = setInterval(checkWedged, Math.max(20, Math.min(1e3, Math.floor(deadlineMs / 4))));
+  watchdog.unref();
   async function close() {
     if (!closed) {
       closed = true;
+      clearInterval(watchdog);
       const pending = [...queue.splice(0), ...slots.flatMap((s) => s.busy ? [s.busy] : [])];
       for (const slot of slots) {
         slot.busy = null;
@@ -40022,6 +40053,7 @@ var init_tool_pool = __esm({
 var http_exports = {};
 __export(http_exports, {
   MAX_ADMITTED: () => MAX_ADMITTED,
+  MAX_ADMITTED_OTHER: () => MAX_ADMITTED_OTHER,
   MAX_BODY_BYTES: () => MAX_BODY_BYTES,
   createEpisodicHttpServer: () => createEpisodicHttpServer,
   readHttpConfig: () => readHttpConfig,
@@ -40099,7 +40131,9 @@ function createEpisodicHttpServer(token, execute) {
   });
   const validHost = localhostHostValidation();
   const validOrigin = localhostOriginValidation();
-  let active = 0;
+  let activeCalls = 0;
+  let activeOther = 0;
+  let reading = 0;
   const http = createServer(async (req, res) => {
     if (!validHost(req, res) || !validOrigin(req, res)) return;
     const presented = Buffer.from(req.headers.authorization ?? "");
@@ -40115,11 +40149,12 @@ function createEpisodicHttpServer(token, execute) {
       res.writeHead(405, { Allow: "POST" }).end();
       return;
     }
-    if (active >= MAX_ADMITTED) {
+    if (reading + activeCalls + activeOther >= MAX_ADMITTED + MAX_ADMITTED_OTHER) {
       res.writeHead(503, { "Retry-After": "1" }).end();
       return;
     }
-    active++;
+    let body;
+    reading++;
     try {
       const chunks = [];
       let size = 0;
@@ -40131,19 +40166,34 @@ function createEpisodicHttpServer(token, execute) {
         }
         chunks.push(Buffer.from(chunk));
       }
-      let body;
       try {
         body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       } catch {
         res.writeHead(400).end();
         return;
       }
+    } catch {
+      if (!res.headersSent) res.writeHead(400).end();
+      else res.destroy();
+      return;
+    } finally {
+      reading--;
+    }
+    const toolCall = containsToolsCall(body);
+    if (toolCall ? activeCalls >= MAX_ADMITTED : activeOther >= MAX_ADMITTED_OTHER) {
+      res.writeHead(503, { "Retry-After": "1" }).end();
+      return;
+    }
+    if (toolCall) activeCalls++;
+    else activeOther++;
+    try {
       await handle(req, res, body);
     } catch {
       if (!res.headersSent) res.writeHead(500).end();
       else res.destroy();
     } finally {
-      active--;
+      if (toolCall) activeCalls--;
+      else activeOther--;
     }
   });
   http.requestTimeout = 3e4;
@@ -40191,13 +40241,25 @@ async function readHttpConfig(env) {
   if (deadlineMs < 1e3) throw new Error("EPISODIC_MEMORY_TOOL_DEADLINE_MS must be at least 1000.");
   return { port, token, workers, deadlineMs };
 }
+async function closePoolBounded(pool, boundMs) {
+  let timer;
+  const bound = new Promise((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), boundMs);
+  });
+  const outcome = await Promise.race([pool.close().then(() => "closed", () => "closed"), bound]);
+  clearTimeout(timer);
+  if (outcome === "timeout") process.stderr.write(`episodic-memory shutdown: worker pool did not close within ${boundMs / 1e3} s
+`);
+}
 async function startHttp(options = {}) {
   const { port: requestedPort, token, workers, deadlineMs } = await readHttpConfig(process.env);
+  const poolCloseBoundMs = options.poolCloseBoundMs ?? POOL_CLOSE_BOUND_MS;
   const pool = createToolPool({
     workerPath: options.workerPath ?? fileURLToPath(new URL("./tool-worker.js", import.meta.url)),
     size: workers,
     deadlineMs,
-    maxQueue: 64
+    maxQueue: 64,
+    onWedged: options.onWedged ?? (() => process.exit(1))
   });
   const service = createEpisodicHttpServer(token, pool.run);
   try {
@@ -40209,8 +40271,7 @@ async function startHttp(options = {}) {
       });
     });
   } catch (error62) {
-    await pool.close().catch(() => {
-    });
+    await closePoolBounded(pool, poolCloseBoundMs);
     throw error62;
   }
   const port = service.http.address().port;
@@ -40219,13 +40280,7 @@ async function startHttp(options = {}) {
     closing ??= (async () => {
       if (service.http.listening) await service.close().catch(() => {
       });
-      let timer;
-      const bound = new Promise((resolve) => {
-        timer = setTimeout(() => resolve("timeout"), POOL_CLOSE_BOUND_MS);
-      });
-      const outcome = await Promise.race([pool.close().then(() => "closed", () => "closed"), bound]);
-      clearTimeout(timer);
-      if (outcome === "timeout") process.stderr.write("episodic-memory shutdown: worker pool did not close within 10 s\n");
+      await closePoolBounded(pool, poolCloseBoundMs);
     })();
     return closing;
   };
@@ -40240,7 +40295,7 @@ async function startHttp(options = {}) {
 `);
   return { port, close };
 }
-var MAX_BODY_BYTES, MAX_ADMITTED, DEFAULT_PORT, POOL_CLOSE_BOUND_MS;
+var MAX_BODY_BYTES, MAX_ADMITTED, MAX_ADMITTED_OTHER, isToolsCall, containsToolsCall, DEFAULT_PORT, POOL_CLOSE_BOUND_MS;
 var init_http = __esm({
   "src/http.ts"() {
     "use strict";
@@ -40250,6 +40305,9 @@ var init_http = __esm({
     init_tool_pool();
     MAX_BODY_BYTES = 1048576;
     MAX_ADMITTED = 16;
+    MAX_ADMITTED_OTHER = 64;
+    isToolsCall = (message) => typeof message === "object" && message !== null && message.method === "tools/call";
+    containsToolsCall = (body) => Array.isArray(body) ? body.some(isToolsCall) : isToolsCall(body);
     DEFAULT_PORT = 8734;
     POOL_CLOSE_BOUND_MS = 1e4;
   }

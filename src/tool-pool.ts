@@ -10,7 +10,14 @@ export class PoolBusyError extends Error {
   }
 }
 
-export type PoolOptions = { workerPath: string; size: number; deadlineMs: number; maxQueue: number };
+export type PoolOptions = {
+  workerPath: string;
+  size: number;
+  deadlineMs: number;
+  maxQueue: number;
+  /** Called at most once when the watchdog finds the pool wedged (see createToolPool). */
+  onWedged?: (reason: string) => void;
+};
 
 type Call = {
   id: number;
@@ -51,13 +58,19 @@ const EXIT_MESSAGE = { type: 'exit' } as const;
  * completion), so live workers (active + retiring) are capped at 2 × size.
  * At the cap a deadline/cancel still answers at once, but the slot stays empty
  * (calls queue, PoolBusyError past maxQueue) until a retiring worker exits.
+ *
+ * Watchdog: since a worker is never terminated, a worker stuck in native code
+ * would hold its capacity forever. If a retiring worker is still alive 2 ×
+ * deadlineMs after it was retired, or calls are queued while no slot is usable
+ * at the cap for 2 × deadlineMs without any dispatch, the pool logs a fixed
+ * line and calls `onWedged` once (the HTTP service exits so launchd restarts it).
  */
 export function createToolPool(options: PoolOptions): {
   run: ToolExecutor;
   close(): Promise<void>;
   stats(): { busy: number; queued: number; size: number; live: number };
 } {
-  const { workerPath, size, deadlineMs, maxQueue } = options;
+  const { workerPath, size, deadlineMs, maxQueue, onWedged } = options;
   const slots: Slot[] = Array.from({ length: size }, () => ({ worker: null, busy: null, awaitingCapacity: false }));
   const queue: Call[] = [];
   // Every live worker (a slot's current worker or a retiring one) → resolves on its 'exit'.
@@ -66,6 +79,11 @@ export function createToolPool(options: PoolOptions): {
   const maxLive = 2 * size;
   let nextId = 1;
   let closed = false;
+  // Watchdog state: retirement time per retiring worker; start of a no-progress stall at the cap.
+  const retiredAt = new Map<Worker, number>();
+  const wedgeAfterMs = 2 * deadlineMs;
+  let stalledSince: number | undefined;
+  let wedged = false;
 
   const canSpawn = () => !closed && live.size < maxLive;
   /** A slot can take a call now: it has a worker, or may spawn one under the cap. */
@@ -73,6 +91,7 @@ export function createToolPool(options: PoolOptions): {
 
   function onWorkerExit(worker: Worker): void {
     live.delete(worker);
+    retiredAt.delete(worker);
     // Capacity freed: refill slots that were retired at the cap, then serve the queue.
     for (const slot of slots) {
       if (slot.awaitingCapacity && slot.worker === null && canSpawn()) spawn(slot);
@@ -119,6 +138,7 @@ export function createToolPool(options: PoolOptions): {
   }
 
   function retire(slot: Slot): void {
+    if (slot.worker) retiredAt.set(slot.worker, Date.now());
     slot.worker?.postMessage(EXIT_MESSAGE); // stays in `live` until it exits
     slot.worker = null;
     replace(slot);
@@ -140,6 +160,7 @@ export function createToolPool(options: PoolOptions): {
 
   function start(slot: Slot, call: Call): void {
     const worker = slot.worker ?? spawn(slot);
+    stalledSince = undefined; // progress
     slot.busy = call;
     call.timer = setTimeout(() => {
       if (slot.busy !== call) return;
@@ -195,9 +216,32 @@ export function createToolPool(options: PoolOptions): {
     });
   };
 
+  function wedge(kind: string): void {
+    wedged = true;
+    clearInterval(watchdog);
+    console.error(`episodic-memory tool pool wedged (${kind}); exiting for a restart`);
+    onWedged?.(kind);
+  }
+
+  function checkWedged(): void {
+    if (closed || wedged) return;
+    const now = Date.now();
+    for (const at of retiredAt.values()) {
+      if (now - at > wedgeAfterMs) return wedge('retiring worker did not exit');
+    }
+    const stalled = queue.length > 0 && live.size >= maxLive && !slots.some(usable);
+    if (!stalled) stalledSince = undefined;
+    else if (stalledSince === undefined) stalledSince = now;
+    else if (now - stalledSince > wedgeAfterMs) wedge('no usable worker at the cap');
+  }
+
+  const watchdog = setInterval(checkWedged, Math.max(20, Math.min(1000, Math.floor(deadlineMs / 4))));
+  watchdog.unref();
+
   async function close(): Promise<void> {
     if (!closed) {
       closed = true;
+      clearInterval(watchdog);
       const pending = [...queue.splice(0), ...slots.flatMap((s) => (s.busy ? [s.busy] : []))];
       for (const slot of slots) {
         slot.busy = null;

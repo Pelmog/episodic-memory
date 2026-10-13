@@ -37,14 +37,25 @@ export declare class EmbeddingsUnavailableError extends Error {
     });
 }
 /**
+ * Process-wide loading options; call before the first load. Only the shared
+ * HTTP service's worker threads use this; stdio and CLI paths keep the
+ * library defaults.
+ */
+export declare function configureEmbeddings(options: {
+    allowRemoteModels?: boolean;
+}): void;
+/**
  * Singleflight: concurrent callers share one in-flight load; a failed load
- * clears so a later call retries.
+ * clears so a later call retries. After disposeEmbeddings() has begun it
+ * throws EmbeddingsUnavailableError instead of loading.
  */
 export declare function initEmbeddings(): Promise<void>;
 /**
  * Releases the ONNX session explicitly. Worker threads call this before
  * exiting: otherwise a GC finalizer can fire after the native addon is
  * unloaded during isolate teardown and crash the process with SIGSEGV.
+ * An in-flight load is awaited (exiting mid-load crashes the process); no new
+ * load can start once this has been called.
  */
 export declare function disposeEmbeddings(): Promise<void>;
 export declare function generateEmbedding(text: string): Promise<number[]>;

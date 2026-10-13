@@ -8,6 +8,8 @@ export type PoolOptions = {
     size: number;
     deadlineMs: number;
     maxQueue: number;
+    /** Called at most once when the watchdog finds the pool wedged (see createToolPool). */
+    onWedged?: (reason: string) => void;
 };
 /**
  * Runs tool calls on a fixed set of worker threads so synchronous SQLite work
@@ -25,6 +27,12 @@ export type PoolOptions = {
  * completion), so live workers (active + retiring) are capped at 2 × size.
  * At the cap a deadline/cancel still answers at once, but the slot stays empty
  * (calls queue, PoolBusyError past maxQueue) until a retiring worker exits.
+ *
+ * Watchdog: since a worker is never terminated, a worker stuck in native code
+ * would hold its capacity forever. If a retiring worker is still alive 2 ×
+ * deadlineMs after it was retired, or calls are queued while no slot is usable
+ * at the cap for 2 × deadlineMs without any dispatch, the pool logs a fixed
+ * line and calls `onWedged` once (the HTTP service exits so launchd restarts it).
  */
 export declare function createToolPool(options: PoolOptions): {
     run: ToolExecutor;

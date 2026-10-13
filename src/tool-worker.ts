@@ -8,12 +8,16 @@ import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import { parentPort } from 'node:worker_threads';
 import { openReadOnlyDatabase } from './db.js';
-import { disposeEmbeddings, initEmbeddings } from './embeddings.js';
+import { configureEmbeddings, disposeEmbeddings, initEmbeddings } from './embeddings.js';
 import { callTool, type ToolResult } from './mcp-tools.js';
 import { resolveReadablePath } from './read-policy.js';
 import { configureSearchDatabase } from './search.js';
 
 const WARM_UP_TIMEOUT_MS = 60_000;
+// How long an exit waits for an in-flight call before disposing anyway. Well
+// under the pool watchdog (2 × the 100 s default deadline), which restarts the
+// service if this worker never exits.
+const EXIT_DRAIN_MS = 30_000;
 
 type PoolMessage = { type: 'exit' } | { type?: undefined; id: number; name: string; args: unknown };
 
@@ -21,14 +25,35 @@ if (!parentPort) throw new Error('tool-worker must run inside a worker thread');
 const port = parentPort;
 
 configureSearchDatabase(openReadOnlyDatabase);
+// Shared mode is offline-only: an unusable model cache fails fast rather than hanging on the network.
+configureEmbeddings({ allowRemoteModels: false });
+
+// Calls still running (the pool sends at most one at a time, but an exit can
+// arrive while it awaits the model or an embedding).
+const inFlight = new Set<Promise<unknown>>();
+let exiting = false;
 
 port.on('message', async (message: PoolMessage) => {
   if (message.type === 'exit') {
+    if (exiting) return;
+    exiting = true;
     // Exiting while the ONNX session is still being created crashes the process
     // (SIGSEGV), so let an in-flight model load settle first. A warm-up that has
     // not started yet (test-only delay) is simply cancelled.
     cancelWarmUpDelay();
     await warmUpSettled;
+    // Disposing the session under a running embedding fails that call ("Session
+    // already disposed") and can crash, so drain in-flight calls first (bounded).
+    if (inFlight.size > 0) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const drained = await Promise.race([
+        Promise.allSettled([...inFlight]).then(() => true),
+        new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), EXIT_DRAIN_MS); }),
+      ]);
+      clearTimeout(timer);
+      if (!drained) console.error(`Tool worker exit: in-flight call still running after ${EXIT_DRAIN_MS} ms; disposing anyway`);
+    }
+    // Also waits for any in-flight model load (unbounded: see above; the pool watchdog is the backstop).
     await disposeEmbeddings();
     // Run native-addon finalizers now, while the addons are still loaded: a GC
     // during isolate teardown can otherwise call into an unloaded addon (SIGSEGV).
@@ -41,6 +66,18 @@ port.on('message', async (message: PoolMessage) => {
     process.exit(0);
   }
   const { id, name, args } = message;
+  if (exiting) {
+    port.postMessage({ id, result: { isError: true, content: [{ type: 'text', text: 'Error: Tool worker is exiting' }] } });
+    return;
+  }
+  // Track the whole call including its reply, so an exit never overtakes the reply.
+  const served = serve(id, name, args);
+  inFlight.add(served);
+  await served;
+  inFlight.delete(served);
+});
+
+async function serve(id: number, name: string, args: unknown): Promise<void> {
   let result: ToolResult;
   try {
     result = await callTool(name, args, { resolveReadPath: resolveReadablePath });
@@ -48,7 +85,7 @@ port.on('message', async (message: PoolMessage) => {
     result = { isError: true, content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }] };
   }
   port.postMessage({ id, result });
-});
+}
 
 // Warm the embedding model in the background; never block message handling on it.
 // On failure, later vector searches retry through initEmbeddings()'s singleflight.
