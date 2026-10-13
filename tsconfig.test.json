@@ -10,7 +10,8 @@
     "test/mcp-baseline.test.ts",
     "test/mcp-server.test.ts",
     "test/read-policy.test.ts",
-    "test/tool-pool.test.ts"
+    "test/tool-pool.test.ts",
+    "test/http.test.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }
