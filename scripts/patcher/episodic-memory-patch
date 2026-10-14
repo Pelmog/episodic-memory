@@ -1,0 +1,816 @@
+#!/usr/bin/env python3
+"""Re-apply the local episodic-memory summarizer patches after a plugin upgrade.
+
+Idempotent and loud: it refuses to guess. Any state that is not cleanly
+"patched" or cleanly "unpatched" is reported as needing a human, never silently
+half-fixed. See the codex-episodic-memory-access / episodic-memory-patch-tool
+memories for why these patches exist.
+"""
+import argparse, contextlib, copy, hashlib, io, json, os, re, shlex, signal, subprocess, sys, tempfile
+from pathlib import Path
+
+DEFAULT_ROOT = Path.home() / ".claude/plugins/cache/superpowers-marketplace/episodic-memory"
+ROOT = Path(os.environ.get("EPISODIC_MEMORY_PLUGIN_ROOT", DEFAULT_ROOT))
+
+# A version dir only counts as installed if BOTH exist, so this resolver and the
+# Codex launcher's can never pick different directories.
+REQUIRED = ("dist/summarizer.js", "cli/mcp-server-wrapper.js")
+
+# id, why, ORIGINAL (unpatched) regex, PATCHED regex, replacement.
+# \1/\2 carry the file's own indentation, so one definition fits both the
+# 8-space dist/summarizer.js and the 4-space src/summarizer.ts.
+PATCHES = [
+    (
+        "strip-mcp",
+        "summarizer's Claude calls must not inherit MCP servers or user settings",
+        re.compile(r"^([ \t]*)max_tokens: 4096,\n([ \t]*)env: getApiEnv\(\),", re.M),
+        re.compile(r"^[ \t]*max_tokens: 4096,\n[ \t]*mcpServers: \{\},\n"
+                   r"[ \t]*strictMcpConfig: true,\n[ \t]*settingSources: \[\],\n"
+                   r"[ \t]*env: getApiEnv\(\),", re.M),
+        r"\1max_tokens: 4096,\n\1mcpServers: {},\n\1strictMcpConfig: true,\n"
+        r"\1settingSources: [],\n\2env: getApiEnv(),",
+    ),
+    (
+        "exclude-turns",
+        "codex-cli >=0.150 rejects paginated thread/fork without it (upstream #158)",
+        re.compile(r"^([ \t]*)threadId: command\.sessionId,\n"
+                   r"([ \t]*)ephemeral: true,\n(?![ \t]*excludeTurns:)", re.M),
+        re.compile(r"^[ \t]*threadId: command\.sessionId,\n[ \t]*ephemeral: true,\n"
+                   r"[ \t]*excludeTurns: true,\n", re.M),
+        r"\1threadId: command.sessionId,\n\2ephemeral: true,\n\2excludeTurns: true,\n",
+    ),
+    (
+        "never-resume",
+        "resuming a live Claude session runs tools in its cwd (upstream #134/#116/#122)",
+        re.compile(r"const claudeSessionId = codexSessionId \? undefined : sessionId;"),
+        re.compile(r"const claudeSessionId = undefined; // local patch: never resume"),
+        "const claudeSessionId = undefined; // local patch: never resume live sessions "
+        "(upstream #134/#116)",
+    ),
+]
+
+# The plugin's own SessionStart sync races this patcher after upgrades. Keep
+# only the empty, deliberately-neutralized state; any upstream shape change
+# needs a human review before a sync worker could import an unsafe summarizer.
+UPSTREAM_HOOKS = """{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/cli/episodic-memory.js\\" sync --background"
+          }
+        ]
+      }
+    ]
+  }
+}
+"""
+NEUTRALIZED_HOOKS = """{
+  "hooks": {
+    "SessionStart": []
+  }
+}
+"""
+HOOK_PATCH = (
+    "disable-plugin-sync",
+    "the plugin SessionStart sync can import an unpatched summarizer before this patcher finishes",
+    re.compile(r"\A" + re.escape(UPSTREAM_HOOKS) + r"\Z"),
+    re.compile(r"\A" + re.escape(NEUTRALIZED_HOOKS) + r"\Z"),
+    NEUTRALIZED_HOOKS,
+)
+
+
+# Upstream 1.5+ supplies tool/settings isolation and Codex excludeTurns.
+# Keep explicit empty MCP config and the stricter local never-resume policy.
+MODERN_PATCHES = [
+    ("strip-mcp", "explicitly empty summarizer MCP servers",
+     re.compile(r"^([ \t]*)tools: \[\],\n(?![ \t]*mcpServers:)", re.M),
+     re.compile(r"^[ \t]*tools: \[\],\n[ \t]*mcpServers: \{\},", re.M),
+     r"\1tools: [],\n\1mcpServers: {},\n"),
+    PATCHES[1],
+    ("never-resume", "never resume a live Claude session",
+     re.compile(r"const claudeSessionId = !codexSessionId && isClaudeSession \? sessionId : undefined;"),
+     re.compile(r"const claudeSessionId = undefined; // local patch: never resume"),
+     "const claudeSessionId = undefined; // local patch: never resume live sessions"),
+]
+NODE = Path.home() / ".local/share/episodic-memory/runtime/node-v24.21.0-darwin-arm64/bin/node"
+LAUNCHER = Path.home() / ".local/bin/episodic-memory-runtime"
+NAPI_SQLITE_RANGE = "^13.0.3"
+NAPI_SQLITE_MIN = (13, 0, 3)
+
+# Written by ~/repos/episodic-memory-v2/scripts/manage-local-service.py
+# (switch-clients / rollback). While it says active, the plugin manifests are
+# meant to carry the shared HTTP service entry instead of the stdio launcher.
+# Schema: STATELESS-HTTP.md ("Persistence across plugin upgrades").
+SWITCH_RECORD = Path.home() / ".local/share/mcp-fleet/episodic-memory/switch-record.json"
+MANIFESTS = (".mcp.json", ".claude-plugin/plugin.json")
+SERVER_KEY = ["mcpServers", "episodic-memory"]
+
+
+class NeedsHuman(Exception):
+    """Ambiguous state: refuse to write anything."""
+
+
+def version_key(name):
+    # (rank, value) pairs never compare int against str, so a non-numeric
+    # version dir sorts instead of raising TypeError.
+    return tuple((0, int(p)) if p.isdigit() else (1, p)
+                 for p in re.split(r"[.\-+]", name))
+
+
+def resolve_version_dir():
+    pinned = os.environ.get("EPISODIC_MEMORY_VERSION_DIR")
+    if pinned:                                  # launcher passes its exact choice
+        d = Path(pinned)
+        if not all((d / r).is_file() for r in REQUIRED):
+            raise NeedsHuman(f"pinned version dir is incomplete: {d}")
+        return d
+    if not ROOT.is_dir():
+        raise NeedsHuman(f"plugin dir not found: {ROOT}")
+    registry = Path.home() / ".claude/plugins/installed_plugins.json"
+    if ROOT == DEFAULT_ROOT and registry.is_file():
+        entries = json.loads(registry.read_text())["plugins"].get("episodic-memory@superpowers-marketplace", [])
+        matches = [Path(e["installPath"]) for e in entries if e.get("scope") == "user"]
+        if len(matches) == 1 and all((matches[0] / r).is_file() for r in REQUIRED):
+            return matches[0]
+        raise NeedsHuman("installed plugin registry has no unique complete user installation")
+    complete = [d for d in ROOT.iterdir()
+                if d.is_dir() and all((d / r).is_file() for r in REQUIRED)]
+    if not complete:
+        raise NeedsHuman(
+            f"no complete install under {ROOT} "
+            f"(need {' + '.join(REQUIRED)}); found: "
+            f"{', '.join(sorted(p.name for p in ROOT.iterdir())) or '(empty)'}")
+    return sorted(complete, key=lambda d: version_key(d.name))[-1]
+
+
+def classify(text, patch):
+    """-> 'applied' | 'missing'; raises NeedsHuman on anything ambiguous."""
+    pid, why, original, patched, _repl = patch
+    n_new, n_old = len(patched.findall(text)), len(original.findall(text))
+    if n_new == 1 and n_old == 0:
+        return "applied"
+    if n_new == 0 and n_old == 1:
+        return "missing"
+    raise NeedsHuman(
+        f"{pid}: ambiguous — {n_new} patched / {n_old} unpatched site(s) found "
+        f"(expected exactly one of either). {why}")
+
+
+def is_pristine(text, patches=PATCHES):
+    """True only if every patch is cleanly absent — a real upstream baseline."""
+    try:
+        return all(classify(text, p) == "missing" for p in patches)
+    except NeedsHuman:
+        return False
+
+
+def write_atomically(path, new_text, expected_old, mode=None):
+    """Replace path only if it still holds expected_old. Never leaves a partial file.
+
+    mode=None keeps the historical behaviour (mkstemp's 0600); callers that
+    must preserve the file's permissions pass them explicitly.
+    """
+    if path.read_text() != expected_old:
+        raise NeedsHuman(f"{path.name} changed on disk mid-run (upgrade race) — "
+                         f"nothing written; re-run")
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(new_text)
+            f.flush()
+            if mode is not None:
+                os.fchmod(f.fileno(), mode)
+            os.fsync(f.fileno())
+        os.replace(tmp, path)                   # atomic within the directory
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def semver_tuple(value):
+    """Return the first numeric semver triple in value, or None."""
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", value or "")
+    return tuple(map(int, match.groups())) if match else None
+
+
+def ensure_napi_sqlite(ver, check_only, log, re_applied=None):
+    """Keep the plugin on better-sqlite3's ABI-stable N-API line.
+
+    The 12.x addon is ABI-specific, and a source build made with Node
+    24.19-24.21 headers can abort later during Statement garbage collection.
+    Install 13.x with scripts disabled: its platform N-API binary is already
+    inside the npm package, so no local compilation or postinstall is needed.
+    """
+    label = "package.json:napi-sqlite"
+    package_path = ver / "package.json"
+    installed_path = ver / "node_modules/better-sqlite3/package.json"
+    if not package_path.is_file():
+        return [], ["  FAIL  package.json absent — cannot enforce N-API SQLite"]
+
+    original = package_path.read_text()
+    package = json.loads(original)
+    dependency = package.get("dependencies", {}).get("better-sqlite3")
+    allow_scripts = package.get("allowScripts", {}).get("better-sqlite3")
+    dependency_floor = semver_tuple(dependency)
+    installed_version = None
+    if installed_path.is_file():
+        installed_version = json.loads(installed_path.read_text()).get("version")
+    installed_semver = semver_tuple(installed_version)
+
+    manifest_ok = (dependency_floor is not None and
+                   dependency_floor >= NAPI_SQLITE_MIN and
+                   allow_scripts in (False, None))
+    installed_ok = installed_semver is not None and installed_semver >= NAPI_SQLITE_MIN
+    if manifest_ok and installed_ok:
+        log(f"  ok    {label} already applied (better-sqlite3 {installed_version})")
+        return [], []
+
+    if check_only:
+        log(f"  WOULD {label} missing (declared {dependency!r}, installed "
+            f"{installed_version!r}, allowScripts={allow_scripts!r})")
+        return [label], []
+
+    # Refuse to rewrite an unexpected dependency policy. The known 1.6.0
+    # baseline is ^12.4.1/true; a partially completed local migration may
+    # already have the 13.x manifest while node_modules still holds 12.x.
+    if dependency != "^12.4.1" and not (dependency_floor and
+                                         dependency_floor >= NAPI_SQLITE_MIN):
+        return [label], [
+            f"  FAIL  {label}: unknown better-sqlite3 dependency {dependency!r}; "
+            "refusing to replace"
+        ]
+    if installed_semver and installed_semver[0] not in (12, 13):
+        return [label], [
+            f"  FAIL  {label}: unexpected installed better-sqlite3 "
+            f"{installed_version!r}; refusing to replace"
+        ]
+
+    new_dependency = (dependency if dependency_floor and
+                      dependency_floor >= NAPI_SQLITE_MIN else NAPI_SQLITE_RANGE)
+    package.setdefault("dependencies", {})["better-sqlite3"] = new_dependency
+    package.setdefault("allowScripts", {})["better-sqlite3"] = False
+    updated = json.dumps(package, indent=2) + "\n"
+    if updated != original:
+        write_atomically(package_path, updated, original)
+
+    npm = NODE.parent / "npm"
+    env = dict(os.environ)
+    env["PATH"] = str(NODE.parent) + os.pathsep + env.get("PATH", "/usr/bin:/bin")
+    try:
+        result = subprocess.run(
+            [str(npm), "install", "--ignore-scripts", "--no-package-lock",
+             f"better-sqlite3@{new_dependency}"],
+            cwd=ver, env=env, capture_output=True, text=True, timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        return [label], [f"  FAIL  {label}: pinned npm install timed out after 180s"]
+    if result.returncode:
+        detail = (result.stdout + result.stderr)[-3000:]
+        return [label], [
+            f"  FAIL  {label}: pinned npm install exited {result.returncode}:\n{detail}"
+        ]
+
+    final_package = json.loads(package_path.read_text())
+    final_dependency = final_package.get("dependencies", {}).get("better-sqlite3")
+    final_allow = final_package.get("allowScripts", {}).get("better-sqlite3")
+    if not installed_path.is_file():
+        return [label], [f"  FAIL  {label}: install completed but package is absent"]
+    final_version = json.loads(installed_path.read_text()).get("version")
+    final_semver = semver_tuple(final_version)
+    if (not final_semver or final_semver < NAPI_SQLITE_MIN or
+            semver_tuple(final_dependency) is None or
+            semver_tuple(final_dependency) < NAPI_SQLITE_MIN or
+            final_allow not in (False, None)):
+        return [label], [
+            f"  FAIL  {label}: post-install state is declared "
+            f"{final_dependency!r}, installed {final_version!r}, "
+            f"allowScripts={final_allow!r}"
+        ]
+
+    if re_applied is not None:
+        re_applied.add(label)
+    log(f"  FIXED {label}: installed better-sqlite3 {final_version} with pinned "
+        f"Node {subprocess.run([str(NODE), '--version'], capture_output=True, text=True).stdout.strip()}")
+    return [label], []
+
+
+def back_up(path, text, log, patches=PATCHES):
+    """Keep exactly one verified-pristine .bak. Never label unknown content as baseline."""
+    bak = path.with_suffix(path.suffix + ".bak")
+    if bak.exists():
+        if not is_pristine(bak.read_text(), patches):
+            log(f"  warn  {path.name}.bak is NOT a clean upstream baseline — "
+                f"do not trust it as the original")
+        return
+    if not is_pristine(text, patches):
+        log(f"  warn  {path.name} is not cleanly unpatched; no .bak written")
+        return
+    try:                                        # O_EXCL: two concurrent hooks can't both win
+        fd = os.open(str(bak), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    log(f"      backed up -> {bak.name}")
+
+
+def process(path, check_only, log, patches=PATCHES):
+    """-> (applied_ids, missing_ids, problems)"""
+    text = original_text = path.read_text()
+    label = f"{path.parent.name}/{path.name}"
+    applied, missing, problems = [], [], []
+
+    states = {}
+    for patch in patches:
+        try:
+            states[patch[0]] = classify(text, patch)
+        except NeedsHuman as e:
+            problems.append(f"  FAIL  {label}: {e}")
+
+    for pid, why, original, _patched, repl in patches:
+        state = states.get(pid)
+        if state is None:
+            continue
+        if state == "applied":
+            log(f"  ok    {label}: {pid} already applied")
+            continue
+        missing.append(pid)
+        if check_only:
+            log(f"  WOULD {label}: {pid} missing")
+            continue
+        text = original.sub(repl, text, count=1)
+        applied.append(pid)
+
+    if applied and not check_only:
+        back_up(path, original_text, log, patches)
+        write_atomically(path, text, original_text)
+        verify = path.read_text()               # prove it, don't assume
+        for pid in applied:
+            patch = next(p for p in patches if p[0] == pid)
+            if classify(verify, patch) != "applied":
+                problems.append(f"  FAIL  {label}: {pid} did not survive the write")
+            else:
+                log(f"  FIXED {label}: {pid} re-applied")
+
+    return applied, missing, problems
+
+
+def load_switch_record():
+    """The active HTTP switch record, or None (absent, unreadable or inactive).
+
+    None means "behave exactly as before the HTTP switch existed": the
+    stdio pinned-runtime logic then judges every manifest on its own.
+    """
+    try:
+        record = json.loads(SWITCH_RECORD.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("active") is not True:
+        return None
+    return record
+
+
+def write_record_atomically(record):
+    """Rewrite the switch record in place: same dir temp file, 0600, os.replace.
+
+    Serialised like manage-local-service.py's write_json so either tool can
+    rewrite it without churn.
+    """
+    data = json.dumps(record, indent=2, ensure_ascii=False) + "\n"
+    fd, tmp = tempfile.mkstemp(dir=str(SWITCH_RECORD.parent),
+                               prefix=SWITCH_RECORD.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+            f.flush()
+            os.fchmod(f.fileno(), 0o600)
+            os.fsync(f.fileno())
+        os.replace(tmp, SWITCH_RECORD)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def recorded_http_entry(files):
+    """The HTTP entry the switch wrote into the recorded plugin manifests.
+
+    Every recorded manifest must agree on it (url + headersHelper); anything
+    else is ambiguous and the caller refuses to guess.
+    """
+    entries = []
+    for path, info in files.items():
+        if not (isinstance(info, dict) and
+                any(path.endswith("/" + rel) for rel in MANIFESTS)):
+            continue
+        if info.get("kind", "json") != "json" or info.get("key", SERVER_KEY) != SERVER_KEY:
+            continue
+        after = info.get("after_entry")
+        if (isinstance(after, dict) and after.get("type") == "http" and
+                isinstance(after.get("url"), str) and after.get("headersHelper")):
+            if after not in entries:
+                entries.append(after)
+    if len(entries) != 1:
+        raise NeedsHuman(f"switch record holds {len(entries)} distinct HTTP manifest "
+                         "entries (expected exactly one to copy)")
+    return copy.deepcopy(entries[0])
+
+
+def recorded_backup_dir(files):
+    """The evidence backups dir the switch already uses (latest if several)."""
+    dirs = sorted({str(Path(info["backup_path"]).parent) for info in files.values()
+                   if isinstance(info, dict) and isinstance(info.get("backup_path"), str)})
+    if not dirs:
+        raise NeedsHuman("switch record has no backup_path to locate its evidence backups dir")
+    return Path(dirs[-1])
+
+
+def back_up_original(path, backup_dir):
+    """0600 byte-exact copy, named like manage-local-service.py's backups; never overwrite."""
+    backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    dest = backup_dir / (hashlib.sha256(str(path).encode()).hexdigest()[:10] + "-" + path.name)
+    data = path.read_bytes()
+    try:
+        fd = os.open(str(dest), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        if dest.read_bytes() != data:
+            raise NeedsHuman(f"backup {dest} already exists with different content; "
+                             "refusing to overwrite it")
+        return dest
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    return dest
+
+
+def is_stdio_form(entry):
+    """The pinned launcher form this tool writes, or the pristine upstream node form."""
+    if not isinstance(entry, dict) or "url" in entry or entry.get("type") not in (None, "stdio"):
+        return False
+    pinned = entry.get("command") == str(LAUNCHER) and entry.get("args") == ["mcp"]
+    return pinned or entry.get("command") == "node"
+
+
+def ensure_transport_http(rel, mcp_path, original, mcp, entry, record, check_only,
+                          log, re_applied=None):
+    """Keep one plugin manifest on the shared HTTP service while the switch is active.
+
+    -> (missing, problems). Recorded + switched is fine; an unrecorded stdio
+    manifest (a newly installed plugin version) is switched and added to the
+    record so rollback restores it; anything else needs a human.
+    """
+    label = f"{rel}:transport-http"
+    key = str(mcp_path)
+    files = record.get("files")
+    if not isinstance(files, dict):
+        return [], [f"  FAIL  {rel}: switch record has no files map; refusing to guess"]
+    info = files.get(key)
+    if info is not None:
+        if isinstance(info, dict) and "after_entry" in info and entry == info["after_entry"]:
+            log(f"  ok    {rel}: transport-http present")
+            return [], []
+        return [], [f"  FAIL  {rel}: episodic-memory entry differs from the switch "
+                    "record's switched entry; refusing to replace (inspect it, then run "
+                    "manage-local-service.py rollback or switch-clients)"]
+    if not is_stdio_form(entry):
+        return [], [f"  FAIL  {rel}: unknown MCP entry under an active HTTP switch "
+                    "record; refusing to replace"]
+    http = recorded_http_entry(files)          # NeedsHuman if ambiguous
+    if check_only:
+        log(f"  WOULD {rel}: transport-http missing")
+        return [label], []
+
+    backup = back_up_original(mcp_path, recorded_backup_dir(files))
+    # Record first (like switch-clients): if the manifest write then fails,
+    # rollback still sees a file that holds its recorded before_entry.
+    fresh = json.loads(SWITCH_RECORD.read_text())
+    if (not isinstance(fresh, dict) or fresh.get("active") is not True or
+            fresh.get("mode") != record.get("mode") or
+            not isinstance(fresh.get("files"), dict) or key in fresh["files"]):
+        raise NeedsHuman("switch record changed mid-run — nothing written; re-run")
+    added = {"before_entry": copy.deepcopy(entry), "after_entry": copy.deepcopy(http),
+             "backup_path": str(backup), "kind": "json", "key": list(SERVER_KEY)}
+    fresh["files"][key] = added
+    write_record_atomically(fresh)
+    mcp["mcpServers"]["episodic-memory"] = http
+    try:
+        write_atomically(mcp_path, json.dumps(mcp, indent=2) + "\n", original,
+                         mode=os.stat(mcp_path).st_mode & 0o7777)
+    except BaseException:
+        # Undo only our own record entry; leave everything else as found.
+        with contextlib.suppress(Exception):
+            undo = json.loads(SWITCH_RECORD.read_text())
+            if undo.get("files", {}).get(key) == added:
+                del undo["files"][key]
+                write_record_atomically(undo)
+        raise
+    verify = json.loads(mcp_path.read_text()).get("mcpServers", {}).get("episodic-memory")
+    if verify != http:
+        return [], [f"  FAIL  {rel}: transport-http did not survive the write"]
+    files[key] = added
+    if re_applied is not None:
+        re_applied.add(label)
+    log(f"  FIXED {rel}: transport-http")
+    return [], []                               # like pinned-runtime: fixed, not "missing"
+
+
+def run(check_only, log, re_applied=None):
+    """-> exit code. 0 clean, 1 patches missing (--check), 2 needs a human."""
+    ver = resolve_version_dir()
+    log(f"episodic-memory {ver.name}  ({ver})")
+
+    missing_any, problems, rebuild_risk = [], [], []
+    for rel in ("dist/summarizer.js", "src/summarizer.ts"):
+        p = ver / rel
+        if not p.is_file():
+            if rel.startswith("dist/"):
+                problems.append(f"  FAIL  {rel} absent — the built server is incomplete")
+            else:
+                # src/ is not what runs, but a stale src means a later `npm run
+                # build` would silently regenerate an UNPATCHED dist.
+                problems.append(f"  warn  {rel} absent — a local rebuild would "
+                                f"regenerate an unpatched dist/")
+                rebuild_risk.append(rel)
+            continue
+        contents = p.read_text()
+        modern = "buildSummarizerQueryOptions" in contents
+        if modern:
+            for guard in ("tools: []", "strictMcpConfig: true", "settingSources: []"):
+                if len(re.findall(r"^[ \t]*" + re.escape(guard) + r",", contents, re.M)) != 1:
+                    problems.append(f"  FAIL  {rel}: expected one upstream guard {guard}")
+        applied, missing, probs = process(p, check_only, log,
+                                         patches=MODERN_PATCHES if modern else PATCHES)
+        if re_applied is not None:
+            re_applied.update(f"{rel}:{pid}" for pid in applied)
+        problems += probs
+        missing_any += [f"{rel}:{m}" for m in missing]
+
+    hook_path = ver / "hooks/hooks.json"
+    if not hook_path.is_file():
+        problems.append("  FAIL  hooks/hooks.json absent — cannot prevent the "
+                        "plugin SessionStart sync race")
+    else:
+        applied, missing, probs = process(hook_path, check_only, log,
+                                          patches=(HOOK_PATCH,))
+        if re_applied is not None:
+            re_applied.update(f"hooks/hooks.json:{pid}" for pid in applied)
+        problems += probs
+        missing_any += [f"hooks/hooks.json:{m}" for m in missing]
+
+    native_missing, native_problems = ensure_napi_sqlite(
+        ver, check_only, log, re_applied=re_applied)
+    missing_any += native_missing
+    problems += native_problems
+
+    # Pin every MCP launch manifest to the dedicated runtime; a package update
+    # must not restore PATH node. Codex reads .mcp.json; Claude Code reads the
+    # mcpServers block in .claude-plugin/plugin.json (verified 2026-09-17: with
+    # only .mcp.json pinned, Claude sessions still spawned `node` = nvm Node 26
+    # and better-sqlite3 failed with NODE_MODULE_VERSION 137 vs 147).
+    # While an HTTP switch record is active the manifests carry the shared
+    # service entry instead (ensure_transport_http); with no active record
+    # every decision below is exactly the stdio one.
+    try:
+        desired = str(LAUNCHER)
+        record = load_switch_record()
+        rels = (".mcp.json", ".claude-plugin/plugin.json")
+        if record is not None and record.get("mode") != "plugin-manifest":
+            rels = ()                           # fail closed: never guess
+            if record.get("mode") == "user-scope":
+                problems.append("  FAIL  user-scope persistence not implemented "
+                                "(active user-scope switch record; plugin manifests "
+                                "not checked)")
+            else:
+                problems.append(f"  FAIL  switch record mode {record.get('mode')!r} "
+                                "unknown; refusing to guess")
+        for rel in rels:
+            mcp_path = ver / rel
+            if not mcp_path.is_file():
+                problems.append(f"  FAIL  {rel} absent — cannot pin the MCP runtime")
+                continue
+            original = mcp_path.read_text()
+            mcp = json.loads(original)
+            entry = mcp.get("mcpServers", {}).get("episodic-memory")
+            if entry is None:
+                problems.append(f"  FAIL  {rel}: no mcpServers.episodic-memory entry")
+                continue
+            if record is not None:
+                try:
+                    missing, probs = ensure_transport_http(
+                        rel, mcp_path, original, mcp, entry, record, check_only,
+                        log, re_applied=re_applied)
+                except Exception as e:          # keep the native probe running
+                    missing, probs = [], [f"  FAIL  {rel}: transport-http: {e}"]
+                missing_any += missing
+                problems += probs
+                continue
+            if entry.get("command") == desired and entry.get("args") == ["mcp"]:
+                log(f"  ok    {rel}: pinned-runtime already applied")
+                continue
+            if entry.get("command") != "node":
+                problems.append(f"  FAIL  {rel}: unknown MCP command "
+                                f"{entry.get('command')!r}; refusing to replace")
+            elif check_only:
+                missing_any.append(f"{rel}:pinned-runtime")
+                log(f"  WOULD {rel}: pinned-runtime missing")
+            else:
+                entry["command"], entry["args"] = desired, ["mcp"]
+                write_atomically(mcp_path, json.dumps(mcp, indent=2) + "\n", original)
+                if re_applied is not None:
+                    re_applied.add(f"{rel}:pinned-runtime")
+                log(f"  FIXED {rel}: pinned-runtime")
+        probe = """const {createRequire}=require('module');
+const r=createRequire(process.argv[1]);
+const version=r('better-sqlite3/package.json').version;
+const D=r('better-sqlite3');
+const d=new D(':memory:');
+r('sqlite-vec').load(d);
+d.exec('CREATE VIRTUAL TABLE native_probe USING vec0(id TEXT PRIMARY KEY, embedding FLOAT[2])');
+const embedding=Buffer.from(new Float32Array([1,0]).buffer);
+d.prepare('INSERT INTO native_probe(id,embedding) VALUES(?,?)').run('probe',embedding);
+const row=d.prepare('SELECT id FROM native_probe WHERE embedding MATCH ? AND k=1').get(embedding);
+if(!row||row.id!=='probe')throw new Error('sqlite-vec returned the wrong row');
+d.close();
+process.stdout.write(JSON.stringify({version,node:process.version,modules:process.versions.modules,napi:process.versions.napi}));"""
+        result = subprocess.run([str(NODE), "-e", probe, str(ver / "package.json")],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            problems.append("  FAIL  native database check: " + result.stderr[-2000:])
+        else:
+            native = json.loads(result.stdout)
+            log("  ok    database vector query under pinned "
+                f"{native['node']} (ABI {native['modules']}, N-API {native['napi']}, "
+                f"better-sqlite3 {native['version']})")
+    except Exception as e:
+        problems.append(f"  FAIL  runtime verification: {e}")
+
+    hard = [p for p in problems if p.lstrip().startswith("FAIL")]
+    for line in problems:
+        log(line)
+
+    if hard:
+        log("\nFAIL  needs a human — upstream shape changed, or the file is in a "
+            "state this tool will not guess at.")
+        return 2
+    if (missing_any or rebuild_risk) and check_only:
+        detail = ", ".join(missing_any + [f"{r} (absent)" for r in rebuild_risk])
+        log(f"\nSTALE {len(missing_any)} patch(es) missing: {detail}\n"
+            f"      Run: episodic-memory-patch")
+        return 1
+    if missing_any:
+        log(f"\nOK    re-applied {len(missing_any)} patch(es).")
+        log("      NOTE: if a background `episodic-memory sync` was already running,")
+        log("      it loaded the UNPATCHED summarizer — re-run the sync to be safe.")
+        return 0
+    log(f"\nOK    all {len(PATCHES) * 2} summarizer patches and the plugin "
+        "sync-hook guard are present.")
+    return 0
+
+
+def find_plugin_sync_processes(ver):
+    """Return only node processes for this version's sync launcher or worker.
+
+    The exact executable paths deliberately exclude cli/mcp-server-wrapper.js
+    and dist/mcp-server.js: killing either would break Claude/Codex memory
+    search instead of stopping the unsafe post-upgrade sync.
+    """
+    launcher = str(ver / "cli/episodic-memory.js")
+    worker = str(ver / "dist/sync-cli.js")
+    listing = subprocess.run(
+        ["ps", "-axo", "pid=,command="],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    matches = []
+    for line in listing.splitlines():
+        fields = line.strip().split(maxsplit=1)
+        if len(fields) != 2 or not fields[0].isdigit():
+            continue
+        pid, command = int(fields[0]), fields[1]
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            continue                            # not positively identified
+        if not argv or Path(argv[0]).name not in ("node", "nodejs"):
+            continue
+        # The launcher must receive sync as its immediate command. The worker
+        # is the detached dist/sync-cli.js process spawned by --background.
+        is_launcher = any(
+            argv[i:i + 2] == [launcher, "sync"]
+            for i in range(len(argv) - 1)
+        )
+        is_worker = worker in argv
+        if is_launcher or is_worker:
+            matches.append((pid, command))
+    return matches
+
+
+def terminate_unsafe_plugin_sync(ver):
+    """SIGTERM exact resolved-version sync processes found after an upgrade."""
+    terminated = []
+    seen = set()
+    # Re-scan once: the launcher can fork its detached worker between the
+    # first process listing and SIGTERM, leaving that unsafe worker behind.
+    for _ in range(2):
+        for pid, command in find_plugin_sync_processes(ver):
+            if pid in seen:
+                continue
+            seen.add(pid)
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue                        # it ended between ps and kill
+            except PermissionError:
+                continue                        # never escalate a hook action
+            terminated.append((pid, command))
+    return terminated
+
+
+def launch_sync(ver):
+    """Detach the single settings-owned sync launcher after verification."""
+    # Guard against the hook-ordering race: sync's worker imports summarizer.js
+    # at startup, so do not launch it until run(--check) proved every patch.
+    log_dir = Path.home() / ".local/state/episodic-memory"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    with (log_dir / "startup-sync.log").open("a") as log_file:
+        subprocess.Popen(
+            [str(LAUNCHER), "sync", "--background", "--only", "claude,codex"],
+            stdin=subprocess.DEVNULL, stdout=log_file, stderr=log_file,
+            start_new_session=True,
+        )
+
+
+
+def hook_mode(start_sync):
+    """Apply silently for SessionStart; never break session startup."""
+    buf = io.StringIO()
+    log = lambda s: print(s, file=buf)
+    try:
+        re_applied = set()
+        rc = run(check_only=False, log=log, re_applied=re_applied)
+        if (start_sync and
+                "hooks/hooks.json:disable-plugin-sync" in re_applied):
+            terminated = terminate_unsafe_plugin_sync(resolve_version_dir())
+            if terminated:
+                pids = ", ".join(str(pid) for pid, _command in terminated)
+                log("  GUARD unsafe post-upgrade sync detected and terminated "
+                    f"(SIGTERM pid(s): {pids}); it could have imported the "
+                    "unpatched summarizer before this hook ran.")
+            else:
+                log("  GUARD unsafe post-upgrade sync detected, but no exact "
+                    "resolved-version launcher/worker remained to terminate.")
+        if rc == 0 and start_sync:
+            verified = io.StringIO()
+            check_rc = run(check_only=True,
+                           log=lambda s: print(s, file=verified))
+            if check_rc != 0:
+                rc = check_rc
+                log("  GUARD SessionStart sync withheld: patch verification "
+                    "failed, preventing a worker from importing an unpatched "
+                    "summarizer.")
+                log(verified.getvalue().strip())
+            else:
+                launch_sync(resolve_version_dir())
+        out = buf.getvalue()
+        if rc != 0 or "  FIXED" in out or "  warn " in out:
+            print(json.dumps({"systemMessage":
+                              "episodic-memory local patches\n" + out.strip()}))
+    except Exception as e:                      # never break session startup
+        print(json.dumps({"systemMessage":
+                          f"episodic-memory patch check failed: "
+                          f"{type(e).__name__}: {e}"}))
+    return 0                                    # hook mode always succeeds
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--check", action="store_true",
+                    help="report only; exit 1 if any patch is missing, 2 if a "
+                         "patch site is ambiguous or gone")
+    ap.add_argument("--hook", action="store_true",
+                    help="SessionStart mode: apply silently, emit a systemMessage "
+                         "only when something was re-applied or went wrong; "
+                         "always exit 0")
+    ap.add_argument("--startup", action="store_true",
+                    help="SessionStart mode: patch, verify, then detach the "
+                         "single settings-owned background sync; always exit 0")
+    args = ap.parse_args()
+
+    if not (args.hook or args.startup):
+        try:
+            return run(args.check, log=print)
+        except NeedsHuman as e:
+            print(f"FAIL  {e}")
+            return 2
+    return hook_mode(args.startup)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
