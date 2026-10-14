@@ -4,7 +4,9 @@
 Never prints the bearer token. All paths derive from HOME, which tests redirect with EM_TEST_HOME.
 """
 import argparse
+import contextlib
 import copy
+import fcntl
 import hashlib
 import json
 import os
@@ -28,6 +30,7 @@ STATE = HOME / ".local/share/mcp-fleet/episodic-memory"
 TOKEN = STATE / "http-token"
 LOG = STATE / "service.log"
 RECORD = STATE / "switch-record.json"
+RECORD_LOCK = STATE / "switch-record.lock"  # shared with ~/.local/bin/episodic-memory-patch
 HEADERS_HELPER = STATE / "headers-helper.sh"
 PLIST = HOME / "Library/LaunchAgents" / f"{LABEL}.plist"
 NODE = HOME / ".local/share/episodic-memory/runtime/node-v24.21.0-darwin-arm64/bin/node"
@@ -100,6 +103,23 @@ def atomic_write(path, data, mode=None):
 
 def stat_mode(path):
     return os.stat(path).st_mode & 0o7777
+
+
+@contextlib.contextmanager
+def record_lock():
+    """Exclusive flock on switch-record.lock (0600), shared with the plugin patcher.
+
+    Held by switch-clients and rollback around their record read, record write and
+    file edits, so the patcher (which takes it to add newly installed plugin versions)
+    never interleaves with them.
+    """
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(RECORD_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def write_json(path, obj, mode=None):
@@ -320,6 +340,10 @@ class Switcher:
 
     # -- apply
     def apply(self):
+        with record_lock():
+            self._apply()
+
+    def _apply(self):
         plan = self.preflight()
         if all(p["done"] for p in plan):
             print("episodic-memory clients already switched; nothing to do")
@@ -408,6 +432,10 @@ class Switcher:
 
     # -- rollback
     def rollback(self):
+        with record_lock():
+            self._rollback()
+
+    def _rollback(self):
         record = load_record()
         if not record:
             raise PreflightError("no switch record; nothing to roll back")

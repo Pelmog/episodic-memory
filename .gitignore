@@ -13,4 +13,4 @@ tmp/
 src/version.ts
 
 # Python bytecode
-scripts/__pycache__/
+__pycache__/

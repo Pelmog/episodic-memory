@@ -379,6 +379,45 @@ class RollbackTests(Base):
         self.assertFalse(jread(mls.RECORD)["active"])
 
 
+class RecordLockTests(Base):
+    """switch-clients and rollback wait for the lock the plugin patcher also takes."""
+
+    def run_while_locked(self, action):
+        import fcntl
+        import threading
+        import time
+        fd = os.open(mls.RECORD_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)          # stands in for a running patcher
+        worker = threading.Thread(target=action)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                worker.start()
+                time.sleep(0.5)
+                self.assertTrue(worker.is_alive(), "did not wait for the record lock")
+                held = self.all_bytes()
+        finally:
+            os.close(fd)
+            worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(stat.S_IMODE(mls.RECORD_LOCK.stat().st_mode), 0o600)
+        return held
+
+    def test_switch_waits_for_lock(self):
+        before = self.all_bytes()
+        held = self.run_while_locked(mls.Switcher("plugin-manifest").apply)
+        self.assertEqual(held, before)          # nothing edited while the lock was held
+        self.assertEqual(self.mcp(), self.entry)
+
+    def test_rollback_waits_for_lock(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            mls.Switcher("plugin-manifest").apply()
+        switched = self.all_bytes()
+        held = self.run_while_locked(mls.Switcher("plugin-manifest").rollback)
+        self.assertEqual(held, switched)
+        self.assertEqual(self.mcp(), STDIO)
+        self.assertFalse(jread(mls.RECORD)["active"])
+
+
 class InstallOrderTests(Base):
     def test_model_cache_is_seeded_and_validated_before_npm_test(self):
         mls.NODE.parent.mkdir(parents=True, exist_ok=True)

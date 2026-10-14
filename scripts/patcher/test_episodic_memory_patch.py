@@ -7,6 +7,7 @@ probe runs for real. Nothing under the real HOME is written.
 
     python3 -m unittest scripts/patcher/test_episodic_memory_patch.py
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -30,8 +32,8 @@ MANIFESTS = (".mcp.json", ".claude-plugin/plugin.json")
 PRISTINE = {"command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/cli/mcp-server-wrapper.js"]}
 
 missing = [p for p in (ORIG, REAL_VERSION_DIR, REAL_RUNTIME) if not p.exists()]
-if missing:
-    raise unittest.SkipTest(f"fixture source absent: {missing}")
+if missing:                                     # fail the suite loudly, never skip
+    raise RuntimeError(f"fixture source absent: {missing}")
 
 
 def sha(path):
@@ -82,14 +84,21 @@ class Tree:
         self.record.write_text(json.dumps(record, indent=2) + "\n")
         self.record.chmod(0o600)
 
-    def run(self, script, *args, pinned=False):
+    def env(self, pinned=False):
         env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin",
                "EPISODIC_MEMORY_PLUGIN_ROOT": str(self.root)}
         if pinned:                              # how episodic-memory-runtime calls it
             env["EPISODIC_MEMORY_VERSION_DIR"] = str(self.ver)
-        r = subprocess.run([sys.executable, str(script), *args], env=env,
+        return env
+
+    def run(self, script, *args, pinned=False):
+        r = subprocess.run([sys.executable, str(script), *args], env=self.env(pinned),
                            capture_output=True, text=True, timeout=120)
         return r.returncode, r.stdout, r.stderr
+
+    def spawn(self, script, *args):
+        return subprocess.Popen([sys.executable, str(script), *args], env=self.env(),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     def snapshot(self):
         """Hash + mtime of every file under the temp tree except node_modules/runtime."""
@@ -327,7 +336,8 @@ class ActivePluginManifest(Base):
             "unrecorded-other-http": ({"type": "http", "url": "http://127.0.0.1:9999/mcp"}, False),
             "unrecorded-non-dict": ("not-an-object", False),
             "recorded-but-drifted": ({"command": "/usr/bin/python3", "args": ["x"]}, True),
-            "recorded-but-stdio": (None, True),     # launcher form, but the path is recorded
+            "recorded-but-other-http": ({"type": "http", "url": "http://127.0.0.1:9999/mcp"}, True),
+            "recorded-but-pristine": (PRISTINE, True),   # stdio, but not the recorded before_entry
         }
         for case, (entry, recorded) in cases.items():
             with self.subTest(case=case):
@@ -352,6 +362,78 @@ class ActivePluginManifest(Base):
                         self.assertEqual(t.entry(".mcp.json"), expected)
                         if args == ["--check"]:
                             self.assertEqual(t.snapshot(), snap)
+                finally:
+                    t.cleanup()
+
+    def test_recorded_but_stdio_warns_writes_nothing_and_is_not_repinned(self):
+        for form in ("launcher", "pristine"):
+            with self.subTest(form=form):
+                t = Tree()
+                try:
+                    record = switched_record(t, t.ver)
+                    for rel in MANIFESTS:
+                        if form == "pristine":
+                            t.set_entry(rel, PRISTINE)
+                        # before_entry is the full entry the switch replaced
+                        record["files"][str(t.ver / rel)]["before_entry"] = t.entry(rel)
+                    t.write_record(record)
+                    expected = {rel: t.entry(rel) for rel in MANIFESTS}
+                    for args in (["--check"], [], ["--hook"]):
+                        snap = t.snapshot()
+                        rc, out, err = t.run(NEW, *args)
+                        self.assertEqual(rc, 0, out + err)
+                        if args == ["--hook"]:      # a warn surfaces as a systemMessage
+                            out = json.loads(out)["systemMessage"]
+                        for rel in MANIFESTS:
+                            self.assertIn(f"  warn  {rel}: recorded for HTTP but currently "
+                                          "stdio — run switch-clients or rollback", out)
+                            self.assertEqual(t.entry(rel), expected[rel])
+                        self.assertNotIn("FAIL", out)
+                        self.assertNotIn("STALE", out)
+                        self.assertNotIn("FIXED", out)
+                        self.assertEqual(t.snapshot(), snap)
+                finally:
+                    t.cleanup()
+
+    def test_apply_waits_for_the_shared_lock(self):
+        self.new_version_record()
+        lock = self.t.state / "switch-record.lock"
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)          # stands in for switch-clients / rollback
+        try:
+            proc = self.t.spawn(NEW)
+            time.sleep(3)
+            self.assertIsNone(proc.poll(), "apply did not wait for the lock")
+            self.assertNotEqual(self.t.entry(".mcp.json"), self.t.http)
+            self.assertEqual(len(json.loads(self.t.record.read_text())["files"]), 2)
+        finally:
+            os.close(fd)
+        out, err = proc.communicate(timeout=120)
+        self.assertEqual(proc.returncode, 0, out + err)
+        self.assertIn("FIXED .mcp.json: transport-http", out)
+        self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
+
+    def test_racing_apply_runs_end_switched_and_recorded(self):
+        for round_ in range(3):
+            with self.subTest(round=round_):
+                t = Tree()
+                try:
+                    t.write_record(switched_record(t, t.root / "1.5.0"))
+                    procs = [t.spawn(NEW) for _ in range(3)]
+                    results = [p.communicate(timeout=120) + (p.returncode,) for p in procs]
+                    for out, err, rc in results:
+                        self.assertEqual(rc, 0, out + err)
+                        self.assertNotIn("FAIL", out)
+                    fixed = sum(out.count("FIXED .mcp.json: transport-http") for out, _, _ in results)
+                    self.assertEqual(fixed, 1)
+                    rec = json.loads(t.record.read_text())
+                    self.assertEqual(len(rec["files"]), 4)
+                    for rel in MANIFESTS:
+                        self.assertEqual(t.entry(rel), t.http)
+                        self.assertEqual(rec["files"][str(t.ver / rel)]["after_entry"], t.http)
+                    rc, out, err = t.run(NEW, "--check")
+                    self.assertEqual(rc, 0, out + err)
+                    self.assertEqual(out.count("transport-http present"), 2)
                 finally:
                     t.cleanup()
 

@@ -6,7 +6,7 @@ Idempotent and loud: it refuses to guess. Any state that is not cleanly
 half-fixed. See the codex-episodic-memory-access / episodic-memory-patch-tool
 memories for why these patches exist.
 """
-import argparse, contextlib, copy, hashlib, io, json, os, re, shlex, signal, subprocess, sys, tempfile
+import argparse, contextlib, copy, fcntl, hashlib, io, json, os, re, shlex, signal, subprocess, sys, tempfile
 from pathlib import Path
 
 DEFAULT_ROOT = Path.home() / ".claude/plugins/cache/superpowers-marketplace/episodic-memory"
@@ -106,6 +106,9 @@ NAPI_SQLITE_MIN = (13, 0, 3)
 # meant to carry the shared HTTP service entry instead of the stdio launcher.
 # Schema: STATELESS-HTTP.md ("Persistence across plugin upgrades").
 SWITCH_RECORD = Path.home() / ".local/share/mcp-fleet/episodic-memory/switch-record.json"
+# Shared with manage-local-service.py (switch-clients / rollback): whoever
+# holds it may re-read and rewrite the record and the files it names.
+SWITCH_LOCK = SWITCH_RECORD.with_name("switch-record.lock")
 MANIFESTS = (".mcp.json", ".claude-plugin/plugin.json")
 SERVER_KEY = ["mcpServers", "episodic-memory"]
 
@@ -377,6 +380,17 @@ def load_switch_record():
     return record
 
 
+@contextlib.contextmanager
+def switch_lock():
+    """Exclusive flock on switch-record.lock (0600); only apply mode takes it."""
+    fd = os.open(str(SWITCH_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)                            # closing releases the lock
+
+
 def write_record_atomically(record):
     """Rewrite the switch record in place: same dir temp file, 0600, os.replace.
 
@@ -477,6 +491,13 @@ def ensure_transport_http(rel, mcp_path, original, mcp, entry, record, check_onl
         if isinstance(info, dict) and "after_entry" in info and entry == info["after_entry"]:
             log(f"  ok    {rel}: transport-http present")
             return [], []
+        if (isinstance(info, dict) and "before_entry" in info and
+                info["before_entry"] != info.get("after_entry") and
+                entry == info["before_entry"]):
+            # A switch that never reached this file, or was restored: harmless,
+            # visible, and left for switch-clients / rollback (never re-pinned).
+            return [], [f"  warn  {rel}: recorded for HTTP but currently stdio — "
+                        "run switch-clients or rollback"]
         return [], [f"  FAIL  {rel}: episodic-memory entry differs from the switch "
                     "record's switched entry; refusing to replace (inspect it, then run "
                     "manage-local-service.py rollback or switch-clients)"]
@@ -488,30 +509,36 @@ def ensure_transport_http(rel, mcp_path, original, mcp, entry, record, check_onl
         log(f"  WOULD {rel}: transport-http missing")
         return [label], []
 
-    backup = back_up_original(mcp_path, recorded_backup_dir(files))
-    # Record first (like switch-clients): if the manifest write then fails,
-    # rollback still sees a file that holds its recorded before_entry.
-    fresh = json.loads(SWITCH_RECORD.read_text())
-    if (not isinstance(fresh, dict) or fresh.get("active") is not True or
-            fresh.get("mode") != record.get("mode") or
-            not isinstance(fresh.get("files"), dict) or key in fresh["files"]):
-        raise NeedsHuman("switch record changed mid-run — nothing written; re-run")
-    added = {"before_entry": copy.deepcopy(entry), "after_entry": copy.deepcopy(http),
-             "backup_path": str(backup), "kind": "json", "key": list(SERVER_KEY)}
-    fresh["files"][key] = added
-    write_record_atomically(fresh)
-    mcp["mcpServers"]["episodic-memory"] = http
-    try:
+    # Under the shared lock: re-read the record and the manifest, back up,
+    # record first (like switch-clients), then edit. A record entry whose file
+    # still holds before_entry is harmless (warn above), so no undo is needed.
+    with switch_lock():
+        fresh = json.loads(SWITCH_RECORD.read_text())
+        if (not isinstance(fresh, dict) or fresh.get("active") is not True or
+                fresh.get("mode") != record.get("mode") or
+                not isinstance(fresh.get("files"), dict)):
+            raise NeedsHuman("switch record changed mid-run — nothing written; re-run")
+        current_text = mcp_path.read_text()
+        current = json.loads(current_text).get("mcpServers", {}).get("episodic-memory")
+        if key in fresh["files"]:
+            if current == fresh["files"][key].get("after_entry"):
+                log(f"  ok    {rel}: transport-http present")   # a concurrent run did it
+                return [], []
+            if current == fresh["files"][key].get("before_entry"):
+                return [], [f"  warn  {rel}: recorded for HTTP but currently stdio — "
+                            "run switch-clients or rollback"]
+            raise NeedsHuman(f"{rel} was recorded by another run mid-run — "
+                             "nothing written; re-run")
+        if current_text != original:
+            raise NeedsHuman(f"{rel} changed on disk mid-run — nothing written; re-run")
+        backup = back_up_original(mcp_path, recorded_backup_dir(fresh["files"]))
+        added = {"before_entry": copy.deepcopy(entry), "after_entry": copy.deepcopy(http),
+                 "backup_path": str(backup), "kind": "json", "key": list(SERVER_KEY)}
+        fresh["files"][key] = added
+        write_record_atomically(fresh)
+        mcp["mcpServers"]["episodic-memory"] = http
         write_atomically(mcp_path, json.dumps(mcp, indent=2) + "\n", original,
                          mode=os.stat(mcp_path).st_mode & 0o7777)
-    except BaseException:
-        # Undo only our own record entry; leave everything else as found.
-        with contextlib.suppress(Exception):
-            undo = json.loads(SWITCH_RECORD.read_text())
-            if undo.get("files", {}).get(key) == added:
-                del undo["files"][key]
-                write_record_atomically(undo)
-        raise
     verify = json.loads(mcp_path.read_text()).get("mcpServers", {}).get("episodic-memory")
     if verify != http:
         return [], [f"  FAIL  {rel}: transport-http did not survive the write"]
