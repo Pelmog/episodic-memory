@@ -178,7 +178,8 @@ class ManifestSwitchTests(Base):
         rec = jread(mls.RECORD)
         self.assertTrue(rec["active"])
         self.assertIn("injected failure", rec["failed"])
-        self.assertEqual(rec["unresolved"], [str(mls.CODEX_CONFIG)])
+        self.assertEqual([u["path"] for u in rec["unresolved"]], [str(mls.CODEX_CONFIG)])
+        self.assertIn("injected failure", rec["unresolved"][0]["reason"])
         mls.Switcher("plugin-manifest").rollback()
         self.assertEqual(self.all_bytes(), before)
         self.assertFalse(jread(mls.RECORD)["active"])
@@ -200,7 +201,30 @@ class ManifestSwitchTests(Base):
         self.assertIn("Bearer", text)
         rec = jread(mls.RECORD)
         self.assertTrue(rec["active"])
-        self.assertEqual(rec["unresolved"], [str(mls.CODEX_CONFIG)])
+        self.assertEqual([u["path"] for u in rec["unresolved"]], [str(mls.CODEX_CONFIG)])
+        self.assertIn("changed after the switch", rec["unresolved"][0]["reason"])
+
+    def test_unreadable_recorded_file_keeps_record_active(self):
+        pj = self.plugin / ".claude-plugin/plugin.json"
+        real_write, calls = mls.Target.write, {"n": 0}
+
+        def write(target, entry):
+            calls["n"] += 1
+            if calls["n"] == 2:  # Codex was switched; plugin.json becomes unreadable, then the 2nd write fails
+                pj.chmod(0o000)
+                raise OSError("injected failure")
+            return real_write(target, entry)
+        try:
+            with mock.patch.object(mls.Target, "write", write):
+                with self.assertRaises(RuntimeError):
+                    mls.Switcher("plugin-manifest").apply()
+            self.assertNotIn("Bearer", mls.CODEX_CONFIG.read_text())  # Codex itself was restored
+            rec = jread(mls.RECORD)
+            self.assertTrue(rec["active"])
+            self.assertEqual([u["path"] for u in rec["unresolved"]], [str(pj)])
+            self.assertIn("cannot be read", rec["unresolved"][0]["reason"])
+        finally:
+            pj.chmod(0o600)
 
     def test_failed_rerun_keeps_record_active_while_files_stay_switched(self):
         mls.Switcher("plugin-manifest").apply()
@@ -251,14 +275,17 @@ class ManifestSwitchTests(Base):
             mls.Switcher("plugin-manifest").apply()
         self.assertIn(".mcp.json", str(cm.exception))
 
-    def test_codex_config_is_tightened_to_0600_with_notice(self):
-        mls.CODEX_CONFIG.chmod(0o644)
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            mls.Switcher("plugin-manifest").apply()
-        self.assertEqual(stat.S_IMODE(mls.CODEX_CONFIG.stat().st_mode), 0o600)
-        self.assertIn("0600", out.getvalue())
-        self.assertNotIn(TOKEN, out.getvalue())
+    def test_codex_config_is_set_to_exactly_0600_with_notice(self):
+        for mode in (0o644, 0o400, 0o700, 0o640):
+            with self.subTest(mode=oct(mode)):
+                self.setUp()
+                mls.CODEX_CONFIG.chmod(mode)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    mls.Switcher("plugin-manifest").apply()
+                self.assertEqual(stat.S_IMODE(mls.CODEX_CONFIG.stat().st_mode), 0o600)
+                self.assertIn("0600", out.getvalue())
+                self.assertNotIn(TOKEN, out.getvalue())
 
     def test_codex_config_at_0600_gets_no_notice(self):
         out = io.StringIO()

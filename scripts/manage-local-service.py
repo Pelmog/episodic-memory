@@ -190,10 +190,11 @@ class Target:
         raw = self.path.read_text()
         if self.kind == "toml":
             mode = stat_mode(self.path)
-            if "http_headers" in entry and mode & 0o077:
-                # The block now holds the bearer token: never leave it group/world readable.
+            if "http_headers" in entry:
+                # The block holds the bearer token: owner read/write only, nothing else.
+                if mode != 0o600:
+                    print(f"set {self.path} permissions to 0600 (was {mode:04o}; it now holds the service bearer token)")
                 mode = 0o600
-                print(f"tightened {self.path} permissions to 0600 (it now holds the service bearer token)")
             atomic_write(self.path, _replace_block(raw, entry).encode(), mode)
         elif self.kind == "text":
             atomic_write(self.path, entry.encode())
@@ -348,7 +349,7 @@ class Switcher:
                 t.write(item["after"])
                 edited.append(item)
         except BaseException as exc:
-            problems, unresolved = [], []
+            unresolved = []
             for item in reversed(edited):
                 t = item["target"]
                 try:
@@ -357,18 +358,22 @@ class Switcher:
                         continue
                     if current != item["after"]:
                         # Edited by someone else after our write: never overwrite it.
-                        problems.append(f"{t.path}: changed after the switch; left as is")
-                        unresolved.append(str(t.path))
+                        unresolved.append({"path": str(t.path), "reason": "changed after the switch; left as is"})
                         continue
                     t.write(item["before"])
                 except Exception as inner:  # noqa: BLE001
-                    problems.append(f"{t.path}: {inner}")
-                    unresolved.append(str(t.path))
-            # The record stays active while any recorded file is still switched (or its
-            # restoration failed), so rollback can still finish the job.
-            record["active"] = bool(unresolved) or self._any_switched(record["files"])
+                    unresolved.append({"path": str(t.path), "reason": f"restore failed: {type(inner).__name__}: {inner}"})
+            # Every other recorded file must be readable and not switched; a file that cannot
+            # be read or parsed might still be switched, so it is unresolved too.
+            seen = {u["path"] for u in unresolved}
+            switched, unreadable = self._switch_state(record["files"])
+            unresolved += [u for u in unreadable if u["path"] not in seen]
+            # The record stays active while any recorded file is still switched or unresolved,
+            # so rollback can still finish the job.
+            record["active"] = bool(unresolved) or switched
             record["unresolved"] = unresolved
-            record["failed"] = f"{type(exc).__name__}: {exc}" + (f" (restore problems: {problems})" if problems else "")
+            problems = [f"{u['path']}: {u['reason']}" for u in unresolved]
+            record["failed"] = f"{type(exc).__name__}: {exc}" + (f" (unresolved: {problems})" if problems else "")
             save_record(record)
             if record["active"]:
                 raise RuntimeError(f"switch failed; the record stays active, run rollback to finish: {record['failed']}") from exc
@@ -376,17 +381,20 @@ class Switcher:
         print(f"switched {len(edited)} file(s) to the shared service ({self.mode}); new sessions pick it up")
 
     @staticmethod
-    def _any_switched(files):
-        """True if any recorded file still holds its switched entry."""
+    def _switch_state(files):
+        """(any recorded file still holds its switched entry, [unreadable files with reasons])."""
+        switched, unreadable = False, []
         for path, info in files.items():
             if info["after_entry"] == info["before_entry"]:
                 continue
             try:
                 if Target.from_record(path, info).read() == info["after_entry"]:
-                    return True
-            except (OSError, ValueError):
-                continue
-        return False
+                    switched = True
+            except FileNotFoundError:
+                continue  # nothing left to restore (rollback skips it too)
+            except (OSError, ValueError) as exc:
+                unreadable.append({"path": path, "reason": f"cannot be read or parsed: {type(exc).__name__}: {exc}"})
+        return switched, unreadable
 
     def _backup(self, t):
         EVIDENCE.mkdir(parents=True, exist_ok=True)

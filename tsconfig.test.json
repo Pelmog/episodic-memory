@@ -18,7 +18,8 @@
     "test/probe-live.test.ts",
     "test/search-db-lifecycle.test.ts",
     "test/db-readonly.test.ts",
-    "test/embeddings-singleflight.test.ts"
+    "test/embeddings-singleflight.test.ts",
+    "test/worker-exit.test.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }

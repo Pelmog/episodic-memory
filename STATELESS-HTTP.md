@@ -56,8 +56,11 @@ byte-identical to the stdio server (fixtures in `test/fixtures/mcp-baseline/`).
   cancel or disconnect the worker is retired and replaced (live workers are
   capped at twice the pool size) and the caller gets a tool error. Workers are
   never terminated (that aborts the process mid ONNX load); a retired worker
-  exits itself after its in-flight call settles (bounded at 30 s) and any model
-  load finishes.
+  disposes its model and exits itself only after its in-flight call has settled
+  and any model load has finished. It never disposes under a running call: if
+  the call is still running after 30 s it logs that and stays retired (still
+  counted toward the cap) until the call settles, or until the watchdog below
+  restarts the service.
 - **Watchdog.** If a retiring worker is still alive 2 × the deadline after it
   was retired, or calls are queued while no worker slot is usable at the cap
   for 2 × the deadline, the service logs `episodic-memory tool pool wedged (...)`
@@ -108,7 +111,7 @@ All via `python3 scripts/manage-local-service.py <command>`. None prints the tok
 |---|---|
 | `install` | Checks the pinned Node, creates the state dir (0700), token (created once, never overwritten), log and headers helper; runs `npm install --no-package-lock` (no lockfile exists) and `npm run build`; native check (better-sqlite3 + sqlite-vec); copies the embedding model cache from the registered plugin install if absent and validates it by an offline load; then `npm test` (embedding tests need the cache); writes the plist, `launchctl bootout` (ignored) and `bootstrap gui/<uid>`; then probes (waits up to 90 s). |
 | `probe` | Runs `scripts/probe-live.mjs` (session-only index overrides removed from its env). First, read-only: the index's `MAX(embedding_version)` must equal this build's `EMBEDDING_VERSION` (`src/embedding-migration.ts`); a mismatch means the index needs `episodic-memory sync` with this build (the service never migrates). Then with a modern and a legacy client: `tools/list` must equal the baseline catalog (name, description, schema, annotations), a text `search`, a `read` of the first hit (lines 1-5), and a default-mode `search` (no `mode`, i.e. vector + text, so the embedding model must work). Prints only counts, versions, latencies and `ok`/`fail`. |
-| `switch-clients [--claude-mode plugin-manifest\|user-scope]` | Requires a passing probe. Preflight reads and parses every target and checks each is the expected pre-switch form, or already switched, which means exactly equal to the recorded switched entry (and, for Codex, carrying the current token); anything else is drift and is refused naming the file. A re-run of a complete switch is a no-op. Writes the 0600 record and backups before editing; edits are atomic. On failure, each file already edited is restored only if it still holds the switched entry (a later edit is left alone); if every recorded file is back to its original the record becomes `active: false` with `failed`, otherwise it stays `active: true` with `failed` and an `unresolved` list, and `rollback` finishes the job. The Codex config is set to 0600 when the bearer is written (a notice is printed if it was wider). |
+| `switch-clients [--claude-mode plugin-manifest\|user-scope]` | Requires a passing probe. Preflight reads and parses every target and checks each is the expected pre-switch form, or already switched, which means exactly equal to the recorded switched entry (and, for Codex, carrying the current token); anything else is drift and is refused naming the file. A re-run of a complete switch is a no-op. Writes the 0600 record and backups before editing; edits are atomic. On failure, each file already edited is restored only if it still holds the switched entry (a later edit is left alone); if every recorded file is readable and back to its original the record becomes `active: false` with `failed`; otherwise (a file still switched, edited by someone else, failed to restore, or unreadable/unparseable) it stays `active: true` with `failed` and an `unresolved` list of `{path, reason}`, and `rollback` finishes the job once those files are fixed. The Codex config is set to exactly 0600 whenever the bearer is written (a one-line notice is printed if its mode changed). |
 | `rollback` | Restores recorded entries; see below. |
 
 `switch-clients` targets:

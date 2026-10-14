@@ -22463,6 +22463,28 @@ function resolveReadablePath(requested, roots = getReadableRoots()) {
   return real;
 }
 
+// src/worker-exit.ts
+async function drainThenExit(options) {
+  const { inFlight: inFlight2, drainMs, dispose, exit, log = (line) => console.error(line) } = options;
+  if (inFlight2.size > 0) {
+    const settled = Promise.allSettled([...inFlight2]);
+    let timer;
+    const drained = await Promise.race([
+      settled.then(() => true),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), drainMs);
+      })
+    ]);
+    clearTimeout(timer);
+    if (!drained) {
+      log(`Tool worker exit: in-flight call still running after ${drainMs} ms; staying retired until it settles (the pool watchdog restarts the service if it never does)`);
+      await settled;
+    }
+  }
+  await dispose();
+  await exit();
+}
+
 // src/tool-worker.ts
 var WARM_UP_TIMEOUT_MS = 6e4;
 var EXIT_DRAIN_MS = 3e4;
@@ -22478,25 +22500,21 @@ port.on("message", async (message) => {
     exiting = true;
     cancelWarmUpDelay();
     await warmUpSettled;
-    if (inFlight.size > 0) {
-      let timer;
-      const drained = await Promise.race([
-        Promise.allSettled([...inFlight]).then(() => true),
-        new Promise((resolve) => {
-          timer = setTimeout(() => resolve(false), EXIT_DRAIN_MS);
-        })
-      ]);
-      clearTimeout(timer);
-      if (!drained) console.error(`Tool worker exit: in-flight call still running after ${EXIT_DRAIN_MS} ms; disposing anyway`);
-    }
-    await disposeEmbeddings();
-    setFlagsFromString("--expose-gc");
-    const gc = runInNewContext("gc");
-    for (let i = 0; i < 3; i++) {
-      gc();
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-    process.exit(0);
+    await drainThenExit({
+      inFlight,
+      drainMs: EXIT_DRAIN_MS,
+      dispose: disposeEmbeddings,
+      exit: async () => {
+        setFlagsFromString("--expose-gc");
+        const gc = runInNewContext("gc");
+        for (let i = 0; i < 3; i++) {
+          gc();
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+        process.exit(0);
+      }
+    });
+    return;
   }
   const { id, name, args } = message;
   if (exiting) {

@@ -11,12 +11,13 @@ import { openReadOnlyDatabase } from './db.js';
 import { configureEmbeddings, disposeEmbeddings, initEmbeddings } from './embeddings.js';
 import { callTool, type ToolResult } from './mcp-tools.js';
 import { resolveReadablePath } from './read-policy.js';
+import { drainThenExit } from './worker-exit.js';
 import { configureSearchDatabase } from './search.js';
 
 const WARM_UP_TIMEOUT_MS = 60_000;
-// How long an exit waits for an in-flight call before disposing anyway. Well
-// under the pool watchdog (2 × the 100 s default deadline), which restarts the
-// service if this worker never exits.
+// After this long, an exit still waiting on an in-flight call logs that it is
+// staying retired; it never disposes under a running call. The pool watchdog
+// (2 × the 100 s default deadline) restarts the service if the call never settles.
 const EXIT_DRAIN_MS = 30_000;
 
 type PoolMessage = { type: 'exit' } | { type?: undefined; id: number; name: string; args: unknown };
@@ -42,28 +43,25 @@ port.on('message', async (message: PoolMessage) => {
     // not started yet (test-only delay) is simply cancelled.
     cancelWarmUpDelay();
     await warmUpSettled;
-    // Disposing the session under a running embedding fails that call ("Session
-    // already disposed") and can crash, so drain in-flight calls first (bounded).
-    if (inFlight.size > 0) {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const drained = await Promise.race([
-        Promise.allSettled([...inFlight]).then(() => true),
-        new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), EXIT_DRAIN_MS); }),
-      ]);
-      clearTimeout(timer);
-      if (!drained) console.error(`Tool worker exit: in-flight call still running after ${EXIT_DRAIN_MS} ms; disposing anyway`);
-    }
-    // Also waits for any in-flight model load (unbounded: see above; the pool watchdog is the backstop).
-    await disposeEmbeddings();
-    // Run native-addon finalizers now, while the addons are still loaded: a GC
-    // during isolate teardown can otherwise call into an unloaded addon (SIGSEGV).
-    setFlagsFromString('--expose-gc');
-    const gc = runInNewContext('gc') as () => void;
-    for (let i = 0; i < 3; i++) {
-      gc();
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-    process.exit(0);
+    // Dispose + exit only once in-flight calls have settled (src/worker-exit.ts);
+    // disposeEmbeddings() also waits for any in-flight model load.
+    await drainThenExit({
+      inFlight,
+      drainMs: EXIT_DRAIN_MS,
+      dispose: disposeEmbeddings,
+      exit: async () => {
+        // Run native-addon finalizers now, while the addons are still loaded: a GC
+        // during isolate teardown can otherwise call into an unloaded addon (SIGSEGV).
+        setFlagsFromString('--expose-gc');
+        const gc = runInNewContext('gc') as () => void;
+        for (let i = 0; i < 3; i++) {
+          gc();
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+        process.exit(0);
+      },
+    });
+    return;
   }
   const { id, name, args } = message;
   if (exiting) {

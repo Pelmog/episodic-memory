@@ -13,10 +13,15 @@ export function getReadableRoots(): string[] {
 
 /**
  * Where `requested` resolves on disk: the realpath of the file when it exists,
- * otherwise the realpath of its deepest existing ancestor joined with the
- * remaining (nonexistent, hence symlink-free) components. Ancestors are taken
- * from the raw string, so `..` after a symlinked directory follows the link the
- * way the filesystem would.
+ * otherwise the realpath of the longest existing prefix of the raw string
+ * (found by stripping trailing components with path.dirname, which does not
+ * normalise) joined with the remaining components. Any `..` inside that
+ * existing prefix is resolved by realpath after symlinks, as the filesystem
+ * would. A `..` in the nonexistent remainder is resolved lexically by
+ * path.join; it can only cancel a nonexistent component (not a symlink) or a
+ * component of the already-resolved real prefix, so the lexical result is the
+ * physical one. (The filesystem could not open such a path anyway; the result
+ * only decides which error is reported.)
  */
 function locate(requested: string): { real: string; exists: boolean } {
   try { return { real: fs.realpathSync(requested), exists: true }; } catch { /* fall through */ }
